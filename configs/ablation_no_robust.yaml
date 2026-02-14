@@ -1,0 +1,3 @@
+# 消融：无干扰流形引导 (w/o Interference Guidance)
+loss:
+  lambda_robust: 0.0

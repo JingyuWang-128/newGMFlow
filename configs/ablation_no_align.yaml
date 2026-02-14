@@ -1,0 +1,3 @@
+# 消融：无 rSMI 对齐 (w/o Tri-Stream 对齐)
+loss:
+  lambda_align: 0.0

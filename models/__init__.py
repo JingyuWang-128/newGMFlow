@@ -2,7 +2,8 @@
 
 from .rq_vae import RQVAE, ResidualQuantizer
 from .mamba_blocks import SelectiveSSM, MambaBlock, CrossScan
-from .tri_stream_mamba import TriStreamMambaUNet
+from .tri_stream_mamba import TriStreamBlock, timestep_embed, SecretModulation
+from .dis import TriStreamDiS
 from .rectified_flow import RectifiedFlowGenerator
 from .decoder import RobustDecoder
 from .interference import InterferenceManifold, build_interference_operators
@@ -13,7 +14,10 @@ __all__ = [
     "SelectiveSSM",
     "MambaBlock",
     "CrossScan",
-    "TriStreamMambaUNet",
+    "TriStreamBlock",
+    "timestep_embed",
+    "SecretModulation",
+    "TriStreamDiS",
     "RectifiedFlowGenerator",
     "RobustDecoder",
     "InterferenceManifold",

@@ -16,6 +16,5 @@ clean-fid>=0.1.0
 ftfy
 regex
 open-clip-torch>=2.20.0
-# Optional: for faster Mamba (Linux + CUDA only)
-# mamba-ssm>=2.0.0
-# causal-conv1d>=1.4.0
+matplotlib>=3.5.0
+# Optional: causal-conv1d>=1.4.0  mamba-ssm>=2.0.0

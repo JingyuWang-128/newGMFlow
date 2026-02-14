@@ -9,19 +9,19 @@ import torch
 import torch.nn as nn
 import math
 
-from .tri_stream_mamba import TriStreamMambaUNet
+from .dis import TriStreamDiS
 
 
 class RectifiedFlowGenerator(nn.Module):
     """
-    基于三流 Mamba U-Net 的 Rectified Flow。
+    基于三流 Mamba DiS 主干的 Rectified Flow。
     前向：给定 x_0（噪声）, x_1（目标图）, t，计算 x_t 与目标速度，用 v_θ 预测并算损失。
     采样：从 x_1 ~ N(0,1) 沿 ODE 积分到 t=0 得到 x_0。
     """
 
-    def __init__(self, unet: TriStreamMambaUNet, num_steps: int = 1000):
+    def __init__(self, backbone: nn.Module, num_steps: int = 1000):
         super().__init__()
-        self.unet = unet
+        self.backbone = backbone
         self.num_steps = num_steps
 
     def get_x_t(self, x_0: torch.Tensor, x_1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -43,7 +43,7 @@ class RectifiedFlowGenerator(nn.Module):
         c_txt: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, list, list]:
         """预测速度及 struc/tex 特征（用于 rSMI）。"""
-        return self.unet(x_t, t, f_sec, c_txt)
+        return self.backbone(x_t, t, f_sec, c_txt)
 
     def predict_x0(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """单步估计: x̂_0 = x_t - (1-t) * v."""
@@ -72,6 +72,6 @@ class RectifiedFlowGenerator(nn.Module):
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t = torch.ones(B, device=device) * (1.0 - (i + 0.5) * dt)
-            v, _, _ = self.unet(x, t, f_sec, c_txt)
+            v, _, _ = self.backbone(x, t, f_sec, c_txt)
             x = x - dt * v
         return x

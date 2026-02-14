@@ -170,8 +170,14 @@ def build_dataset_from_config(config: Dict[str, Any]) -> tuple:
     return cover_dataset, secret_dataset
 
 
-def get_train_dataloader(config: Dict[str, Any], use_stego_pair: bool = True) -> DataLoader:
-    """获取训练 DataLoader。若 use_stego_pair 则返回 (cover, secret, text) 批；否则需在训练中另行组合。"""
+def get_train_dataloader(
+    config: Dict[str, Any],
+    use_stego_pair: bool = True,
+    rank: int = 0,
+    world_size: int = 1,
+    shuffle: bool = True,
+) -> DataLoader:
+    """获取训练 DataLoader。支持 DDP：传入 rank/world_size 时使用 DistributedSampler。"""
     data_cfg = config.get("data", {})
     batch_size = data_cfg.get("batch_size", 8)
     num_workers = data_cfg.get("num_workers", 4)
@@ -192,10 +198,16 @@ def get_train_dataloader(config: Dict[str, Any], use_stego_pair: bool = True) ->
         secret_size=secret_size,
         max_samples=data_cfg.get("num_train_samples"),
     )
+    sampler = None
+    if world_size > 1:
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
+        shuffle = False
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,

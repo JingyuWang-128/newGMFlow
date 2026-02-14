@@ -1,15 +1,15 @@
 #!/bin/bash
-# 消融实验：可通过覆盖配置关闭三流/干扰引导等（需在 config 中增加对应开关后再用）
-# 示例：训练 baseline（无干扰引导）时可将 loss.lambda_robust 设为 0
+# 消融实验：对多组 checkpoint 运行评估并生成对比图与表格
+# 使用方式：
+#   1) 先分别训练各变体，将 final.pt 放到 outputs/ablation/<变体名>/ 下
+#   2) 执行: bash scripts/run_ablation.sh
 set -e
 cd "$(dirname "$0")/.."
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 
-# 完整模型
-echo "Training full model..."
-python train.py --config configs/default.yaml --override configs/train.yaml --device "${1:-cuda}"
-
-# 无鲁棒引导：先复制配置并设 lambda_robust=0，再训练
-# cp configs/train.yaml configs/train_no_robust.yaml
-# 编辑 configs/train_no_robust.yaml 添加 loss.lambda_robust: 0
-# python train.py --config configs/default.yaml --override configs/train_no_robust.yaml --device cuda
+OUT="${1:-outputs/ablation}"
+NUM_BATCHES="${2:-15}"
+echo "Output: $OUT, Num batches: $NUM_BATCHES"
+python scripts/run_ablation.py --mode eval --output_base "$OUT" --num_batches "$NUM_BATCHES" \
+  --variants full no_align no_robust \
+  --checkpoint_dir "$OUT"

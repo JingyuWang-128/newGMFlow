@@ -6,6 +6,7 @@ project:
   output_dir: ./outputs
   save_every: 5000
   log_every: 100
+  vis_every: 1000
 
 # 数据
 data:
@@ -36,14 +37,14 @@ rq_vae:
   downsample: 8
   commitment_cost: 0.25
 
-# Tri-Stream Mamba & Rectified Flow
+# Tri-Stream Mamba DiS & Rectified Flow
 generator:
+  img_size: 256
+  patch_size: 4
   in_channels: 3
   model_channels: 256
   out_channels: 3
-  num_res_blocks: 2
-  channel_mult: [1, 2, 3, 4]
-  num_heads: 4
+  num_layers: 12
   d_state: 16
   d_conv: 4
   expand: 2
