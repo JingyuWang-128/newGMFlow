@@ -1,0 +1,15 @@
+# 训练用配置（覆盖 default 部分项）
+
+project:
+  output_dir: ./outputs/run_train
+  save_every: 2000
+  log_every: 50
+
+data:
+  batch_size: 16
+  num_workers: 8
+
+train:
+  epochs: 50
+  lr_generator: 2e-4
+  warmup_steps: 5000
