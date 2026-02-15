@@ -1,91 +1,23 @@
-# GenMamba-Flow 默认配置
+# 默认配置（更深/更宽模型以更好实现隐写与鲁棒解码）
+# 可通过 configs/train.yaml 等 override 覆盖
 
 project:
-  name: GenMamba-Flow
-  seed: 42
-  output_dir: ./outputs
+  output_dir: ./outputs/default
   save_every: 5000
   log_every: 100
   vis_every: 1000
 
-# 数据（自动划分训练/验证/测试）
 data:
-  image_size: 256
-  secret_size: 256
-  num_workers: 4
   batch_size: 8
-  # 从以下目录递归收集图片，再按 split_ratios 划分
-  cover_roots:
-    - ./data/placeholder/DIV2K
-    - ./data/placeholder/COCO
-  secret_roots:
-    - ./data/placeholder/Paris_StreetView
-    - ./data/placeholder/CelebA-HQ
-  # 训练 / 验证 / 测试 比例，和为 1
+  num_workers: 4
   split_ratios: [0.8, 0.1, 0.1]
   split_seed: 42
-  num_train_samples: null   # null 表示使用划分后全部训练样本；可设整数限制
+  num_train_samples: 10000
+  cover_roots: []
+  secret_roots: []
 
-# RQ-VAE
-rq_vae:
-  in_channels: 3
-  latent_channels: 256
-  num_embeddings: 8192
-  num_layers: 4
-  downsample: 8
-  commitment_cost: 0.25
-
-# Tri-Stream Mamba DiS & Rectified Flow
-generator:
-  img_size: 256
-  patch_size: 4
-  in_channels: 3
-  model_channels: 256
-  out_channels: 3
-  num_layers: 12
-  d_state: 16
-  d_conv: 4
-  expand: 2
-  num_flow_steps: 1000
-  text_embed_dim: 768
-  secret_embed_dim: 256
-
-# 解码器
-decoder:
-  in_channels: 3
-  hidden_dim: 256
-  num_layers: 4
-  d_state: 16
-  d_conv: 4
-  expand: 2
-  num_rq_depths: 4
-  num_embeddings: 8192
-
-# 干扰流形
-interference:
-  operators:
-    - jpeg
-    - gaussian_noise
-    - crop
-    - blur
-  jpeg_quality_range: [30, 90]
-  noise_sigma_range: [0.0, 0.2]
-  crop_ratio_range: [0.5, 1.0]
-  blur_sigma_range: [0.0, 2.0]
-
-# 损失权重
-loss:
-  lambda_flow: 1.0
-  lambda_align: 0.1
-  lambda_robust: 0.5
-  lambda_commit: 0.25
-  align_temperature: 0.07
-  contrastive_temperature: 0.07
-  robust_depth_weights: [1.0, 0.8, 0.6, 0.4]
-
-# 训练
 train:
-  epochs: 100
+  epochs: 50
   lr_generator: 1e-4
   lr_decoder: 2e-4
   lr_rq_vae: 1e-4
@@ -93,7 +25,59 @@ train:
   warmup_steps: 2000
   grad_clip: 1.0
 
-# 评估
+# 生成器：DiS 主干 + Rectified Flow（加深加宽）
+generator:
+  img_size: 256
+  patch_size: 4
+  in_channels: 3
+  out_channels: 3
+  model_channels: 384
+  num_layers: 18
+  d_state: 16
+  d_conv: 4
+  expand: 2
+  text_embed_dim: 768
+  secret_embed_dim: 256
+  num_flow_steps: 1000
+  # 使用官方 mamba_ssm 的 Mamba（已安装 mamba-ssm）；设为 false 则退回纯 PyTorch Selective SSM
+  use_mamba_ssm: true
+
+# RQ-VAE：编码/解码每 block 残差层数 + 通道倍数
+rq_vae:
+  in_channels: 3
+  latent_channels: 256
+  num_embeddings: 8192
+  num_layers: 4
+  downsample: 8
+  commitment_cost: 0.25
+  channel_mult: [1, 2, 2, 4]
+  num_res: 3
+
+# 鲁棒解码器：加深加宽
+decoder:
+  in_channels: 3
+  hidden_dim: 384
+  num_layers: 8
+  d_state: 16
+  d_conv: 4
+  expand: 2
+  num_rq_depths: 4
+  num_embeddings: 8192
+
+loss:
+  align_temperature: 0.07
+  robust_depth_weights: [1.0, 0.8, 0.6, 0.4]
+  lambda_flow: 1.0
+  lambda_align: 0.1
+  lambda_robust: 0.5
+
+interference:
+  operators: ["jpeg", "gaussian_noise", "crop", "blur"]
+  noise_sigma_range: [0.0, 0.2]
+  blur_sigma_range: [0.0, 2.0]
+  crop_ratio_range: [0.5, 1.0]
+  jpeg_quality_range: [30, 90]
+
 eval:
   num_samples: 1000
   fid_batch_size: 50

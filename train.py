@@ -63,20 +63,21 @@ def get_text_encoder(config, device):
 
 
 def build_backbone(config):
-    """根据 config 构建 DiS 主干。"""
+    """根据 config 构建 DiS 主干（更深/更宽以提升隐写与重建能力）。"""
     gen_cfg = config.get("generator", {})
     return TriStreamDiS(
         img_size=gen_cfg.get("img_size", 256),
         patch_size=gen_cfg.get("patch_size", 4),
         in_channels=gen_cfg.get("in_channels", 3),
-        model_channels=gen_cfg.get("model_channels", 256),
+        model_channels=gen_cfg.get("model_channels", 384),
         out_channels=gen_cfg.get("out_channels", 3),
-        num_layers=gen_cfg.get("num_layers", 12),
+        num_layers=gen_cfg.get("num_layers", 18),
         d_state=gen_cfg.get("d_state", 16),
         d_conv=gen_cfg.get("d_conv", 4),
         expand=gen_cfg.get("expand", 2),
         text_embed_dim=gen_cfg.get("text_embed_dim", 768),
         secret_embed_dim=gen_cfg.get("secret_embed_dim", 256),
+        use_mamba_ssm=gen_cfg.get("use_mamba_ssm", True),
     )
 
 
@@ -91,13 +92,15 @@ def build_models(config, device, use_ddp: bool = False, rank: int = 0):
         num_layers=rq_cfg.get("num_layers", 4),
         downsample=rq_cfg.get("downsample", 8),
         commitment_cost=rq_cfg.get("commitment_cost", 0.25),
+        channel_mult=rq_cfg.get("channel_mult", [1, 2, 2, 4]),
+        num_res=rq_cfg.get("num_res", 3),
     ).to(device)
     backbone = build_backbone(config).to(device)
     flow = RectifiedFlowGenerator(backbone, num_steps=gen_cfg.get("num_flow_steps", 1000)).to(device)
     decoder = RobustDecoder(
         in_channels=dec_cfg.get("in_channels", 3),
-        hidden_dim=dec_cfg.get("hidden_dim", 256),
-        num_layers=dec_cfg.get("num_layers", 4),
+        hidden_dim=dec_cfg.get("hidden_dim", 384),
+        num_layers=dec_cfg.get("num_layers", 8),
         d_state=dec_cfg.get("d_state", 16),
         d_conv=dec_cfg.get("d_conv", 4),
         expand=dec_cfg.get("expand", 2),

@@ -66,6 +66,7 @@ class TriStreamDiS(nn.Module):
         expand: int = 2,
         text_embed_dim: int = 768,
         secret_embed_dim: int = 256,
+        use_mamba_ssm: bool = True,
     ):
         super().__init__()
         self.img_size = img_size
@@ -83,7 +84,7 @@ class TriStreamDiS(nn.Module):
         self.time_embed_input_dim = model_channels
         self.text_proj = nn.Linear(text_embed_dim, model_channels)
         self.blocks = nn.ModuleList([
-            TriStreamBlock(model_channels, d_state, d_conv, expand, secret_embed_dim, text_embed_dim)
+            TriStreamBlock(model_channels, d_state, d_conv, expand, secret_embed_dim, text_embed_dim, use_mamba_ssm=use_mamba_ssm)
             for _ in range(num_layers)
         ])
         self.norm_out = nn.LayerNorm(model_channels)

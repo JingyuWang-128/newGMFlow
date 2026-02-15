@@ -29,7 +29,7 @@ class ResidualBlock(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, num_res: int = 2):
+    def __init__(self, in_ch: int, out_ch: int, num_res: int = 3):
         super().__init__()
         self.down = nn.Conv2d(in_ch, out_ch, 3, stride=2, padding=1)
         self.res = nn.Sequential(*[ResidualBlock(out_ch) for _ in range(num_res)])
@@ -40,7 +40,7 @@ class EncoderBlock(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, num_res: int = 2):
+    def __init__(self, in_ch: int, out_ch: int, num_res: int = 3):
         super().__init__()
         self.res = nn.Sequential(*[ResidualBlock(in_ch) for _ in range(num_res)])
         self.up = nn.Sequential(
@@ -112,6 +112,7 @@ class RQVAE(nn.Module):
         downsample: int = 8,
         commitment_cost: float = 0.25,
         channel_mult: List[int] = None,
+        num_res: int = 3,
     ):
         super().__init__()
         channel_mult = channel_mult or [1, 2, 2, 4]
@@ -122,7 +123,7 @@ class RQVAE(nn.Module):
         chs = [in_channels] + [latent_channels * m for m in channel_mult]
         enc_blocks = []
         for i in range(len(chs) - 1):
-            enc_blocks.append(EncoderBlock(chs[i], chs[i + 1]))
+            enc_blocks.append(EncoderBlock(chs[i], chs[i + 1], num_res=num_res))
         self.encoder = nn.Sequential(*enc_blocks)
         self.enc_to_latent = nn.Conv2d(chs[-1], latent_channels, 1)
 
@@ -133,7 +134,7 @@ class RQVAE(nn.Module):
         self.latent_to_dec = nn.Conv2d(latent_channels, chs[-1], 1)
         dec_blocks = []
         for i in range(len(chs) - 1, 0, -1):
-            dec_blocks.append(DecoderBlock(chs[i], chs[i - 1]))
+            dec_blocks.append(DecoderBlock(chs[i], chs[i - 1], num_res=num_res))
         self.decoder = nn.Sequential(*dec_blocks)
         self.dec_out = nn.Conv2d(chs[0], in_channels, 3, padding=1)
 

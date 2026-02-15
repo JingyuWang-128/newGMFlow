@@ -12,7 +12,19 @@ import torch.nn.functional as F
 from einops import rearrange
 
 import math
-from .mamba_blocks import SelectiveSSM
+from .mamba_blocks import SelectiveSSM, HAS_MAMBA_SSM
+
+if HAS_MAMBA_SSM:
+    from mamba_ssm import Mamba as MambaSSM
+else:
+    MambaSSM = None
+
+
+def _build_ssm(dim: int, d_state: int, d_conv: int, expand: int, use_mamba_ssm: bool) -> nn.Module:
+    """DiS 的 S 可选用 Selective SSM（PyTorch）或官方 Mamba（mamba_ssm）。"""
+    if use_mamba_ssm and MambaSSM is not None:
+        return MambaSSM(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
+    return SelectiveSSM(dim, d_state=d_state, d_conv=d_conv, expand=expand)
 
 
 def timestep_embed(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -72,18 +84,19 @@ class TriStreamBlock(nn.Module):
         secret_dim: int = 256,
         text_dim: int = 768,
         freeze_semantic: bool = False,
+        use_mamba_ssm: bool = True,
     ):
         super().__init__()
         self.freeze_semantic = freeze_semantic
         self.sem_norm = nn.LayerNorm(dim)
-        self.sem_ssm = SelectiveSSM(dim, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.sem_ssm = _build_ssm(dim, d_state, d_conv, expand, use_mamba_ssm)
         self.sem_proj = nn.Linear(text_dim, dim)
 
         self.struc_norm = nn.LayerNorm(dim)
-        self.struc_ssm = SelectiveSSM(dim, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.struc_ssm = _build_ssm(dim, d_state, d_conv, expand, use_mamba_ssm)
 
         self.tex_norm = nn.LayerNorm(dim)
-        self.tex_ssm = SelectiveSSM(dim, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.tex_ssm = _build_ssm(dim, d_state, d_conv, expand, use_mamba_ssm)
         self.secret_mod = SecretModulation(secret_dim, dim)
 
     def forward(
