@@ -7,6 +7,7 @@ GenMamba-Flow 训练脚本（单脚本完成全部阶段，支持多卡 DDP）
 import argparse
 import os
 import random
+import sys
 from pathlib import Path
 
 import torch
@@ -19,7 +20,7 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 from utils.config import get_config
-from data.datasets import get_train_dataloader
+from data.datasets import get_train_dataloader, get_secret_train_dataloader
 from models.rq_vae import RQVAE
 from models.dis import TriStreamDiS
 from models.rectified_flow import RectifiedFlowGenerator
@@ -114,7 +115,10 @@ def train_rq_vae(rq_vae, dataloader, config, device, save_dir, rank: int = 0):
     """阶段1：预训练 RQ-VAE（仅 rank0 执行并保存）。"""
     if rank != 0:
         return
-    opt = torch.optim.AdamW(rq_vae.parameters(), lr=config.get("train", {}).get("lr_rq_vae", 1e-4), weight_decay=0.01)
+    train_cfg = config.get("train", {})
+    lr = train_cfg.get("lr_rq_vae", 1e-4)
+    lr = float(lr) if isinstance(lr, str) else lr
+    opt = torch.optim.AdamW(rq_vae.parameters(), lr=lr, weight_decay=0.01)
     steps = config.get("data", {}).get("num_train_samples") or 10000
     steps = min(steps, 20000)
     pbar = tqdm(range(steps), desc="[Stage1] RQ-VAE pretrain")
@@ -139,7 +143,8 @@ def train_rq_vae(rq_vae, dataloader, config, device, save_dir, rank: int = 0):
     torch.save(rq_vae.state_dict(), Path(save_dir) / "rq_vae.pt")
 
 
-def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=None):
+def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=None, stage: str = "all"):
+    """stage: 1=仅RQ-VAE, 2=仅生成器+解码器, all=两阶段都跑。"""
     proj = config.get("project", {})
     save_dir = Path(proj.get("output_dir", "./outputs"))
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -148,17 +153,57 @@ def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=N
     set_seed(proj.get("seed", 42) + rank)
 
     use_ddp = world_size > 1
+    rq_path = save_dir / "rq_vae.pt"
+
+    if rank == 0:
+        from data.datasets import print_split_stats
+        print_split_stats(config)
+
     dataloader = get_train_dataloader(config, rank=rank, world_size=world_size)
     rq_vae, flow, decoder, interference = build_models(config, device, use_ddp=use_ddp, rank=rank)
-    text_encoder, text_dim = get_text_encoder(config, device)
+
+    # ---------- 阶段 1 ----------
+    if stage == "1":
+        if rank == 0:
+            dataloader_s1 = get_secret_train_dataloader(config)
+            train_rq_vae(rq_vae, dataloader_s1, config, device, save_dir, rank=rank)
+            torch.save(rq_vae.state_dict(), rq_path)
+        if use_ddp:
+            dist.barrier()
+            if rank != 0:
+                rq_vae.load_state_dict(torch.load(rq_path, map_location=device))
+        if rank == 0:
+            print("Stage 1 done. RQ-VAE saved to", rq_path)
+        return
+
+    # ---------- 阶段 2（stage=all 时若无 rq_vae.pt 先跑阶段1再阶段2）----------
+    # 仅当明确指定 --stage 2 且没有预训练权重时报错
+    if stage == "2" and not rq_path.exists():
+        raise FileNotFoundError("Stage 2 需要已预训练的 RQ-VAE: %s 不存在。请先运行阶段1: python train.py --stage 1" % rq_path)
+
+    if stage == "all" and not rq_path.exists():
+        if rank == 0:
+            dataloader_s1 = get_secret_train_dataloader(config)
+            train_rq_vae(rq_vae, dataloader_s1, config, device, save_dir, rank=rank)
+            torch.save(rq_vae.state_dict(), rq_path)
+        if use_ddp:
+            dist.barrier()
+            if rank != 0:
+                rq_vae.load_state_dict(torch.load(rq_path, map_location=device))
+        if rank == 0:
+            print("Stage 1 done. Starting Stage 2.")
+    else:
+        rq_vae.load_state_dict(torch.load(rq_path, map_location=device))
+        if use_ddp and rank != 0:
+            rq_vae.load_state_dict(torch.load(rq_path, map_location=device))
+    rq_vae.eval()
+
+    text_encoder, _ = get_text_encoder(config, device)
     if isinstance(text_encoder, nn.Module):
         text_encoder = text_encoder
 
     loss_cfg = config.get("loss", {})
-    L_align_fn = rSMIAlignmentLoss(
-        temperature=loss_cfg.get("align_temperature", 0.07),
-        lambda_reg=0.01,
-    )
+    L_align_fn = rSMIAlignmentLoss(temperature=loss_cfg.get("align_temperature", 0.07), lambda_reg=0.01)
     L_robust_fn = RobustDecodingLoss(depth_weights=loss_cfg.get("robust_depth_weights", [1.0, 0.8, 0.6, 0.4]))
     lambda_flow = loss_cfg.get("lambda_flow", 1.0)
     lambda_align = loss_cfg.get("lambda_align", 0.1)
@@ -166,33 +211,23 @@ def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=N
 
     flow_module = flow.module if use_ddp else flow
     decoder_module = decoder.module if use_ddp else decoder
+    train_cfg = config.get("train", {})
+    def _num(k, default):
+        v = train_cfg.get(k, default)
+        return float(v) if isinstance(v, str) else v
     opt_gen = torch.optim.AdamW(
         list(flow_module.parameters()) + list(rq_vae.parameters()),
-        lr=config.get("train", {}).get("lr_generator", 1e-4),
-        weight_decay=config.get("train", {}).get("weight_decay", 0.01),
+        lr=_num("lr_generator", 1e-4),
+        weight_decay=_num("weight_decay", 0.01),
     )
     opt_dec = torch.optim.AdamW(
         decoder_module.parameters(),
-        lr=config.get("train", {}).get("lr_decoder", 2e-4),
-        weight_decay=config.get("train", {}).get("weight_decay", 0.01),
+        lr=_num("lr_decoder", 2e-4),
+        weight_decay=_num("weight_decay", 0.01),
     )
     scaler = GradScaler() if device.type == "cuda" else None
-    grad_clip = config.get("train", {}).get("grad_clip", 1.0)
+    grad_clip = _num("grad_clip", 1.0)
 
-    rq_path = save_dir / "rq_vae.pt"
-    if rq_path.exists():
-        rq_vae.load_state_dict(torch.load(rq_path, map_location=device))
-    elif config.get("train", {}).get("pretrain_rq", True):
-        dataloader_single = get_train_dataloader(config, rank=0, world_size=1) if use_ddp else dataloader
-        train_rq_vae(rq_vae, dataloader_single, config, device, save_dir, rank=rank)
-        if use_ddp:
-            torch.save(rq_vae.state_dict(), rq_path)
-    if use_ddp:
-        dist.barrier()
-        if rank != 0:
-            rq_vae.load_state_dict(torch.load(rq_path, map_location=device))
-
-    rq_vae.eval()
     log_every = proj.get("log_every", 100)
     save_every = proj.get("save_every", 5000)
     vis_every = proj.get("vis_every", 1000)
@@ -204,7 +239,7 @@ def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=N
             dataloader.sampler.set_epoch(epoch)
         flow.train()
         decoder.train()
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}", disable=(rank != 0))
+        pbar = tqdm(dataloader, desc="Epoch %d" % (epoch + 1), disable=(rank != 0))
         for batch in pbar:
             cover = batch["cover"].to(device)
             secret = batch["secret"].to(device)
@@ -271,42 +306,46 @@ def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=N
             if global_step % log_every == 0 and rank == 0:
                 pbar.set_postfix(flow=L_flow.item(), align=L_align.item(), robust=L_robust.item(), dec=L_dec.item())
             if global_step % vis_every == 0 and rank == 0:
-                plot_loss_curves(loss_history, str(vis_dir / "loss_curves.png"), smooth=min(50, len(loss_history) // 2))
+                plot_loss_curves(loss_history, str(vis_dir / "loss_curves.png"), smooth=min(50, len(loss_history) // 2 or 1))
                 save_loss_history(loss_history, str(save_dir / "loss_history.json"))
                 with torch.no_grad():
                     stego_vis = flow_module.sample(cover[:4].shape, f_sec[:4], c_txt[:4] if c_txt is not None else None, num_steps=8, device=device)
                     pred_indices = decoder_module.predict_indices(stego_vis)
                     recovered = rq_vae.decode_from_indices(pred_indices)
                 from utils.visualization import save_stego_comparison
-                save_stego_comparison(cover[:4], stego_vis, secret[:4], recovered, str(vis_dir / f"stego_step{global_step}.png"), nrow=4)
+                save_stego_comparison(cover[:4], stego_vis, secret[:4], recovered, str(vis_dir / ("stego_step%d.png" % global_step)), nrow=4)
             if global_step % save_every == 0:
                 if rank == 0:
-                    torch.save({
-                        "flow": flow_module.state_dict(),
-                        "decoder": decoder_module.state_dict(),
-                        "rq_vae": rq_vae.state_dict(),
-                        "step": global_step,
-                    }, save_dir / "checkpoint.pt")
+                    torch.save({"flow": flow_module.state_dict(), "decoder": decoder_module.state_dict(), "rq_vae": rq_vae.state_dict(), "step": global_step}, save_dir / "checkpoint.pt")
                 if use_ddp:
                     dist.barrier()
 
     if rank == 0:
         plot_loss_curves(loss_history, str(vis_dir / "loss_curves_final.png"), smooth=min(50, max(1, len(loss_history) // 2)))
         save_loss_history(loss_history, str(save_dir / "loss_history.json"))
-        torch.save({
-            "flow": flow_module.state_dict(),
-            "decoder": decoder_module.state_dict(),
-            "rq_vae": rq_vae.state_dict(),
-        }, save_dir / "final.pt")
+        torch.save({"flow": flow_module.state_dict(), "decoder": decoder_module.state_dict(), "rq_vae": rq_vae.state_dict()}, save_dir / "final.pt")
         print("Training done. Saved to", save_dir)
 
 
 def main():
+    def _excepthook(etype, value, tb):
+        import traceback
+        traceback.print_exception(etype, value, tb)
+        sys.__excepthook__(etype, value, tb)
+    sys.excepthook = _excepthook
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--override", default=None)
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--stage", default="all", choices=["1", "2", "all"], help="1=仅RQ-VAE, 2=仅生成器+解码器, all=两阶段")
     args = parser.parse_args()
+
+    script_dir = Path(__file__).resolve().parent
+    if not Path(args.config).is_absolute():
+        args.config = str(script_dir / args.config)
+    if args.override and not Path(args.override).is_absolute():
+        args.override = str(script_dir / args.override)
     config = get_config(args.config, args.override)
     proj = config.get("project", {})
 
@@ -316,12 +355,20 @@ def main():
     if world_size > 1:
         dist.init_process_group(backend="nccl")
         device = torch.device("cuda", local_rank)
+        try:
+            torch.cuda.set_device(device)
+            _ = torch.zeros(1, device=device)
+        except Exception as e:
+            print("[Rank %d] CUDA device %d 不可用: %s" % (rank, local_rank, e), flush=True)
+            raise
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_main(config, device, rank=rank, world_size=world_size, resume_path=args.resume)
-    if world_size > 1:
-        dist.destroy_process_group()
+    try:
+        train_main(config, device, rank=rank, world_size=world_size, resume_path=args.resume, stage=args.stage)
+    finally:
+        if world_size > 1:
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

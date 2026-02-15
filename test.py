@@ -14,7 +14,7 @@ import numpy as np
 from tqdm import tqdm
 
 from utils.config import get_config
-from data.datasets import get_train_dataloader
+from data.datasets import get_train_dataloader, get_test_dataloader
 from models.rq_vae import RQVAE
 from models.rectified_flow import RectifiedFlowGenerator
 from models.decoder import RobustDecoder
@@ -60,7 +60,9 @@ def run_eval(config, device, ckpt_path: str, output_dir: str, num_batches: int =
     rq_vae.eval()
     flow.eval()
     decoder.eval()
-    dataloader = get_train_dataloader(config, rank=0, world_size=1)
+    from data.datasets import print_split_stats
+    print_split_stats(config)
+    dataloader = get_test_dataloader(config)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -129,7 +131,7 @@ def run_robustness_curves(config, device, ckpt_path: str, output_dir: str, use_m
     flow.eval()
     decoder.eval()
     interference = InterferenceManifold(config.get("interference", {}))
-    dataloader = get_train_dataloader(config, rank=0, world_size=1)
+    dataloader = get_test_dataloader(config)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

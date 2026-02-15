@@ -8,25 +8,23 @@ project:
   log_every: 100
   vis_every: 1000
 
-# 数据
+# 数据（自动划分训练/验证/测试）
 data:
   image_size: 256
   secret_size: 256
   num_workers: 4
   batch_size: 8
-  train_datasets:
-    - name: div2k
-      root: ./data/placeholder/DIV2K
-      split: train
-    - name: coco
-      root: ./data/placeholder/COCO
-      split: train
-  secret_datasets:
-    - name: paris
-      root: ./data/placeholder/Paris_StreetView
-    - name: celeba_hq
-      root: ./data/placeholder/CelebA-HQ
-  num_train_samples: 100000
+  # 从以下目录递归收集图片，再按 split_ratios 划分
+  cover_roots:
+    - ./data/placeholder/DIV2K
+    - ./data/placeholder/COCO
+  secret_roots:
+    - ./data/placeholder/Paris_StreetView
+    - ./data/placeholder/CelebA-HQ
+  # 训练 / 验证 / 测试 比例，和为 1
+  split_ratios: [0.8, 0.1, 0.1]
+  split_seed: 42
+  num_train_samples: null   # null 表示使用划分后全部训练样本；可设整数限制
 
 # RQ-VAE
 rq_vae:
