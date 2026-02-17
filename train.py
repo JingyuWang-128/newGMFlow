@@ -28,6 +28,7 @@ from models.decoder import RobustDecoder
 from models.interference import InterferenceManifold
 from losses.alignment import rSMIAlignmentLoss
 from losses.robust import RobustDecodingLoss
+from losses.contrastive import hDCELoss
 from utils.vis_plots import plot_loss_curves, save_loss_history
 
 
@@ -106,6 +107,7 @@ def build_models(config, device, use_ddp: bool = False, rank: int = 0):
         expand=dec_cfg.get("expand", 2),
         num_rq_depths=dec_cfg.get("num_rq_depths", 4),
         num_embeddings=dec_cfg.get("num_embeddings", 8192),
+        latent_channels=rq_cfg.get("latent_channels", 256),
     ).to(device)
     interference = InterferenceManifold(config.get("interference", {})).to(device)
     if use_ddp:
@@ -208,9 +210,13 @@ def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=N
     loss_cfg = config.get("loss", {})
     L_align_fn = rSMIAlignmentLoss(temperature=loss_cfg.get("align_temperature", 0.07), lambda_reg=0.01)
     L_robust_fn = RobustDecodingLoss(depth_weights=loss_cfg.get("robust_depth_weights", [1.0, 0.8, 0.6, 0.4]))
+    use_hdce = loss_cfg.get("use_hdce", True)
+    lambda_hdce = loss_cfg.get("lambda_hdce", 0.5)
+    hdce_fn = hDCELoss(temperature=loss_cfg.get("hdce_temperature", 0.07), num_hard=loss_cfg.get("hdce_num_hard", 16)) if use_hdce else None
     lambda_flow = loss_cfg.get("lambda_flow", 1.0)
     lambda_align = loss_cfg.get("lambda_align", 0.1)
     lambda_robust = loss_cfg.get("lambda_robust", 0.5)
+    detach_for_robust = loss_cfg.get("detach_for_robust", True)
 
     flow_module = flow.module if use_ddp else flow
     decoder_module = decoder.module if use_ddp else decoder
@@ -267,7 +273,7 @@ def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=N
                 L_flow = F.mse_loss(v_pred, v_target)
                 L_align = L_align_fn(all_struc, all_tex)
                 x0_hat = flow_module.predict_x0(x_t, t, v_pred)
-                x0_pert = interference(x0_hat.detach(), num_apply=1)
+                x0_pert = interference(x0_hat.detach() if detach_for_robust else x0_hat, num_apply=1)
                 logits_list = decoder(x0_pert)
                 L_robust = L_robust_fn(logits_list, indices_list)
                 L_gen = lambda_flow * L_flow + lambda_align * L_align + lambda_robust * L_robust
@@ -285,8 +291,18 @@ def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=N
             with autocast(enabled=(device.type == "cuda")):
                 with torch.no_grad():
                     stego = flow_module.sample(cover.shape, f_sec, c_txt, num_steps=8, device=device)
-                logits_list_d = decoder(stego)
-                L_dec = L_robust_fn(logits_list_d, indices_list)
+                if use_hdce and hdce_fn is not None:
+                    logits_list_d, feat_256 = decoder(stego, return_feat=True)
+                    L_dec_ce = L_robust_fn(logits_list_d, indices_list)
+                    L_hdce = 0.0
+                    for d in range(len(indices_list)):
+                        cb = rq_vae.quantizers[d].get_codebook()
+                        idx = indices_list[d].flatten(1)
+                        L_hdce = L_hdce + hdce_fn(feat_256, cb, idx)
+                    L_dec = L_dec_ce + lambda_hdce * (L_hdce / max(len(indices_list), 1))
+                else:
+                    logits_list_d = decoder(stego)
+                    L_dec = L_robust_fn(logits_list_d, indices_list)
             opt_dec.zero_grad()
             if scaler:
                 scaler.scale(L_dec).backward()

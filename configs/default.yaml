@@ -70,6 +70,12 @@ loss:
   lambda_flow: 1.0
   lambda_align: 0.1
   lambda_robust: 0.5
+  use_hdce: true
+  lambda_hdce: 0.5
+  hdce_temperature: 0.07
+  hdce_num_hard: 16
+  # 为 false 时 L_robust 梯度回传生成器（内生鲁棒/对抗性梯度）
+  detach_for_robust: false
 
 interference:
   operators: ["jpeg", "gaussian_noise", "crop", "blur"]

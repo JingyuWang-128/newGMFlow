@@ -3,7 +3,7 @@
 基于 Mamba，使用语义辅助对比检索（hDCE）训练。
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -75,21 +75,24 @@ class RobustDecoder(nn.Module):
         expand: int = 2,
         num_rq_depths: int = 4,
         num_embeddings: int = 8192,
+        latent_channels: int = 256,
     ):
         super().__init__()
         self.backbone = DecoderBackbone(in_channels, hidden_dim, num_layers, d_state, d_conv, expand)
         self.head = IndexHead(hidden_dim, num_embeddings, num_rq_depths)
         self.num_rq_depths = num_rq_depths
         self.num_embeddings = num_embeddings
+        self.latent_channels = latent_channels
+        self.feat_proj = nn.Linear(hidden_dim, latent_channels)
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+    def forward(self, x: torch.Tensor, return_feat: bool = False) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], torch.Tensor]]:
         """
         x: (B, 3, H, W) 隐写图或受干扰图
+        return_feat: 为 True 时额外返回 (B, L, latent_channels) 特征，用于 hDCE。
         Returns:
-            logits_list: 每层 (B, H', W', K)，H'*W' 与 RQ-VAE 潜在网格一致（默认 H/16, W/16）
+            logits_list 或 (logits_list, feat_256)
         """
         feat, h, w = self.backbone(x)
-        # 对齐 RQ-VAE 潜在空间：通常 16x 下采样
         latent_h, latent_w = max(1, x.shape[2] // 16), max(1, x.shape[3] // 16)
         feat_2d = rearrange(feat, "b (h w) c -> b c h w", h=h, w=w)
         feat_2d = F.adaptive_avg_pool2d(feat_2d, (latent_h, latent_w))
@@ -99,6 +102,9 @@ class RobustDecoder(nn.Module):
         for logits in logits_list:
             logits = rearrange(logits, "b (h w) k -> b h w k", h=latent_h, w=latent_w)
             out.append(logits)
+        if return_feat:
+            feat_256 = self.feat_proj(feat)
+            return out, feat_256
         return out
 
     def predict_indices(self, x: torch.Tensor) -> List[torch.Tensor]:
