@@ -13,8 +13,19 @@ data:
   split_ratios: [0.8, 0.1, 0.1]
   split_seed: 42
   num_train_samples: 10000
-  cover_roots: []
-  secret_roots: []
+  # 训练 Stage2 用 cover 辅助（外观目标），测试无载体（仅 secret）。四个数据集按 split_ratios 逐数据集划分后合并。
+  cover_roots:
+    - ./data/placeholder/CelebA-HQ
+    - ./data/placeholder/COCO
+    - ./data/placeholder/DIV2K
+    - ./data/placeholder/Paris_StreetView
+  secret_roots:
+    - ./data/placeholder/CelebA-HQ
+    - ./data/placeholder/COCO
+    - ./data/placeholder/DIV2K
+    - ./data/placeholder/Paris_StreetView
+  # 存在则从文件加载划分，不存在则按 ratios/seed 逐数据集划分并写入该文件，保证前后一致
+  split_file: data/splits.json
 
 train:
   epochs: 50

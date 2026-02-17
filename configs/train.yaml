@@ -1,0 +1,18 @@
+# 训练用覆盖配置（与 run_train.sh 默认 OVERRIDE 对应）
+# 用法：bash run_train.sh configs/default.yaml configs/train.yaml
+
+project:
+  output_dir: ./outputs/run_train
+  save_every: 2000
+  log_every: 50
+  vis_every: 1000
+
+data:
+  batch_size: 16
+  num_workers: 8
+  split_seed: 42
+
+train:
+  epochs: 50
+  lr_generator: 2e-4
+  warmup_steps: 5000

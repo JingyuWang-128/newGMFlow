@@ -31,16 +31,18 @@ def save_recovery_grid(
 
 
 def save_stego_comparison(
-    cover: torch.Tensor,
+    cover: Optional[torch.Tensor],
     stego: torch.Tensor,
     secret: torch.Tensor,
     recovered: torch.Tensor,
     path: str,
     nrow: int = 4,
 ):
-    """cover/stego/secret/recovered (B,3,H,W). 保存四宫格对比。"""
+    """cover/stego/secret/recovered (B,3,H,W)。无载体时 cover 可为 None，首列用黑图占位。"""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     to_img = lambda t: tensor_to_uint8(t).float() / 255
+    if cover is None:
+        cover = torch.zeros_like(stego)
     rows = []
     for i in range(cover.shape[0]):
         row = torch.cat([to_img(cover[i:i+1]), to_img(stego[i:i+1]), to_img(secret[i:i+1]), to_img(recovered[i:i+1])], dim=0)

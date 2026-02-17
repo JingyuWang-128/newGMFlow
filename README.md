@@ -1,6 +1,6 @@
 # GenMamba-Flow: Robust Generative Steganography
 
-基于解耦 Mamba 流与干扰流形引导的鲁棒生成式隐写术。生成器采用 **DiS 类架构**（Patch + 三流 Mamba 序列），支持 **多卡训练/测试**，**单脚本** 完成训练与测试，并带 **完整可视化**（损失曲线、隐写对比、指标图、鲁棒性曲线、消融对比）。
+基于解耦 Mamba 流与干扰流形引导的鲁棒**无载体**生成式隐写术。生成器采用 **DiS 类架构**（Patch + 三流 Mamba 序列），支持 **多卡训练/测试**，**单脚本** 完成训练与测试，并带 **完整可视化**（损失曲线、隐写对比、指标图、鲁棒性曲线、消融对比）。训练与测试均为**无载体**：仅用秘密图生成隐写图，无需独立载体图。
 
 ## 创新点
 
@@ -23,7 +23,7 @@ pip install -r requirements.txt
 - 覆盖/条件图像：`data/placeholder/DIV2K`, `data/placeholder/COCO`
 - 秘密图像：`data/placeholder/Paris_StreetView`, `data/placeholder/CelebA-HQ`
 
-支持任意图像目录结构（递归收集 `.jpg/.png` 等）。
+支持任意图像目录结构（递归收集 `.jpg/.png` 等）。本实现为**无载体隐写**：训练 Stage2 与测试均仅使用秘密图像，生成隐写图不依赖独立载体图。
 
 ## 生成器架构：DiS
 

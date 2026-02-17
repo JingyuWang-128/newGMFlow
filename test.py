@@ -77,11 +77,11 @@ def run_eval(config, device, ckpt_path: str, output_dir: str, num_batches: int =
     for bi, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Eval")):
         if bi >= num_batches:
             break
-        cover = batch["cover"].to(device)
         secret = batch["secret"].to(device)
-        texts = batch.get("text", ["a natural image"] * cover.shape[0])
+        B = secret.shape[0]
+        texts = ["a natural image"] * B
         if isinstance(texts, str):
-            texts = [texts] * cover.shape[0]
+            texts = [texts] * B
         with torch.no_grad():
             indices_list = rq_vae.get_indices(secret)
             f_sec = rq_vae.encode(secret)
@@ -90,7 +90,7 @@ def run_eval(config, device, ckpt_path: str, output_dir: str, num_batches: int =
             c_txt = text_encoder(texts)
             if c_txt.dim() == 1:
                 c_txt = c_txt.unsqueeze(0)
-            stego = _flow_sample(flow, cover.shape, f_sec, c_txt, num_steps_sample, device)
+            stego = _flow_sample(flow, secret.shape, f_sec, c_txt, num_steps_sample, device)
             pred_indices = _decoder_predict_indices(decoder, stego)
             recovered = rq_vae.decode_from_indices(pred_indices)
         ba = compute_bit_accuracy(pred_indices, indices_list)
@@ -101,9 +101,9 @@ def run_eval(config, device, ckpt_path: str, output_dir: str, num_batches: int =
 
         if bi < 5:
             save_stego_comparison(
-                cover, stego, secret, recovered,
+                None, stego, secret, recovered,
                 str(output_dir / f"compare_batch{bi}.png"),
-                nrow=min(4, cover.shape[0]),
+                nrow=min(4, B),
             )
             save_recovery_grid(secret, recovered, str(output_dir / f"recovery_batch{bi}.png"), nrow=4)
             save_depth_recovery(rq_vae, pred_indices, str(output_dir / f"depth_recovery_batch{bi}.png"), depth_steps=[1, 2, 3, 4])
@@ -139,18 +139,17 @@ def run_robustness_curves(config, device, ckpt_path: str, output_dir: str, use_m
     results = {str(q): [] for q in jpeg_qualities}
     from train import get_text_encoder
     text_encoder, _ = get_text_encoder(config, device)
-
     for batch in tqdm(list(dataloader)[:15], desc="Robustness"):
-        cover = batch["cover"].to(device)
         secret = batch["secret"].to(device)
-        texts = batch.get("text", ["a natural image"] * cover.shape[0])
+        B = secret.shape[0]
+        texts = ["a natural image"] * B
         with torch.no_grad():
             indices_list = rq_vae.get_indices(secret)
             f_sec = rq_vae.encode(secret)
             _, _, qlist, _ = rq_vae.quantize_residual(f_sec)
             f_sec = sum(qlist)
             c_txt = text_encoder(texts)
-            stego = _flow_sample(flow, cover.shape, f_sec, c_txt, 16, device)
+            stego = _flow_sample(flow, secret.shape, f_sec, c_txt, 16, device)
         for q in jpeg_qualities:
             stego_jpeg = interference.jpeg_op(stego, quality=q)
             if stego_jpeg.device != device:

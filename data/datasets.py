@@ -3,6 +3,7 @@ GenMamba-Flow 数据集与 DataLoader
 从指定目录递归收集图片，按比例划分训练/验证/测试集，供训练与测试使用。
 """
 
+import json
 import random
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -62,6 +63,8 @@ def get_cover_and_secret_paths_from_config(config: Dict[str, Any]) -> Tuple[List
     all_secret = []
     for r in secret_roots:
         all_secret.extend(collect_image_paths(r))
+    all_cover = sorted(all_cover)
+    all_secret = sorted(all_secret)
     return all_cover, all_secret
 
 
@@ -70,14 +73,62 @@ def get_split_paths_from_config(config: Dict[str, Any]) -> Tuple[
     Tuple[List[str], List[str]],
     Tuple[List[str], List[str]],
 ]:
-    """根据 config 收集路径并按 split_ratios 划分。返回 (train_cover, train_secret), (val_cover, val_secret), (test_cover, test_secret)。"""
-    all_cover, all_secret = get_cover_and_secret_paths_from_config(config)
-    ratios = config.get("data", {}).get("split_ratios", [0.8, 0.1, 0.1])
-    seed = config.get("data", {}).get("split_seed", 42)
+    """
+    根据 config 收集路径并按 split_ratios 划分。返回 (train_cover, train_secret), (val_cover, val_secret), (test_cover, test_secret)。
+    若配置了 data.split_file 且该文件存在，则从文件加载划分（保证 run_train 与 run_test 使用相同划分）；
+    否则按 ratios/seed 计算划分，并写入 data.split_file（若配置了该键）供后续一致使用。
+    """
+    data_cfg = config.get("data", {})
+    split_file = data_cfg.get("split_file")
+    if split_file:
+        split_path = Path(split_file)
+        if split_path.exists():
+            with open(split_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return (
+                (data["train_cover"], data["train_secret"]),
+                (data["val_cover"], data["val_secret"]),
+                (data["test_cover"], data["test_secret"]),
+            )
+    ratios = data_cfg.get("split_ratios", [0.8, 0.1, 0.1])
+    seed = data_cfg.get("split_seed", 42)
     if len(ratios) != 3:
         ratios = [0.8, 0.1, 0.1]
-    train_cover, val_cover, test_cover = split_paths(all_cover, ratios, seed)
-    train_secret, val_secret, test_secret = split_paths(all_secret, ratios, seed)
+    cover_roots = data_cfg.get("cover_roots", [])
+    secret_roots = data_cfg.get("secret_roots", [])
+    if not cover_roots:
+        cover_roots = ["./data/placeholder/DIV2K"]
+    if not secret_roots:
+        secret_roots = ["./data/placeholder/Paris_StreetView"]
+    train_cover, val_cover, test_cover = [], [], []
+    for r in cover_roots:
+        paths = sorted(collect_image_paths(r))
+        if not paths:
+            continue
+        tr, va, te = split_paths(paths, ratios, seed)
+        train_cover.extend(tr)
+        val_cover.extend(va)
+        test_cover.extend(te)
+    train_secret, val_secret, test_secret = [], [], []
+    for r in secret_roots:
+        paths = sorted(collect_image_paths(r))
+        if not paths:
+            continue
+        tr, va, te = split_paths(paths, ratios, seed)
+        train_secret.extend(tr)
+        val_secret.extend(va)
+        test_secret.extend(te)
+    if split_file:
+        Path(split_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(split_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "train_cover": train_cover,
+                "train_secret": train_secret,
+                "val_cover": val_cover,
+                "val_secret": val_secret,
+                "test_cover": test_cover,
+                "test_secret": test_secret,
+            }, f, indent=2, ensure_ascii=False)
     return (train_cover, train_secret), (val_cover, val_secret), (test_cover, test_secret)
 
 
@@ -195,23 +246,25 @@ def _make_stego_dataloader(
 
 
 def get_train_dataloader(config: Dict[str, Any], rank: int = 0, world_size: int = 1, shuffle: bool = True) -> DataLoader:
-    """获取训练集 DataLoader（使用划分后的训练集）。支持 DDP。"""
+    """获取训练集 DataLoader（Stage2 用 cover 辅助训练，目标仍为无载体模型）。支持 DDP。"""
     (train_cover, train_secret), _, _ = get_split_paths_from_config(config)
+    data_cfg = config.get("data", {})
     if not train_cover or not train_secret:
-        data_cfg = config.get("data", {})
         cover_roots = data_cfg.get("cover_roots", ["./data/placeholder/DIV2K"])
         secret_roots = data_cfg.get("secret_roots", ["./data/placeholder/Paris_StreetView"])
         train_cover = []
         for r in cover_roots:
             train_cover.extend(collect_image_paths(r))
+        train_cover = sorted(train_cover)
         train_secret = []
         for r in secret_roots:
             train_secret.extend(collect_image_paths(r))
+        train_secret = sorted(train_secret)
     return _make_stego_dataloader(config, train_cover, train_secret, rank=rank, world_size=world_size, shuffle=shuffle, drop_last=True)
 
 
 def get_val_dataloader(config: Dict[str, Any], batch_size: Optional[int] = None) -> DataLoader:
-    """获取验证集 DataLoader。"""
+    """获取验证集 DataLoader（cover + secret 配对，与训练一致）。"""
     _, (val_cover, val_secret), _ = get_split_paths_from_config(config)
     if not val_cover or not val_secret:
         return get_train_dataloader(config, rank=0, world_size=1)
@@ -225,24 +278,19 @@ def get_val_dataloader(config: Dict[str, Any], batch_size: Optional[int] = None)
 
 
 def get_test_dataloader(config: Dict[str, Any], batch_size: Optional[int] = None) -> DataLoader:
-    """获取测试集 DataLoader。"""
-    _, _, (test_cover, test_secret) = get_split_paths_from_config(config)
-    if not test_cover or not test_secret:
-        data_cfg = config.get("data", {})
-        cover_roots = data_cfg.get("cover_roots", ["./data/placeholder/DIV2K"])
+    """获取测试集 DataLoader（无载体隐写：仅返回 secret）。"""
+    _, _, (_, test_secret) = get_split_paths_from_config(config)
+    data_cfg = config.get("data", {})
+    if not test_secret:
         secret_roots = data_cfg.get("secret_roots", ["./data/placeholder/Paris_StreetView"])
-        test_cover = []
-        for r in cover_roots:
-            test_cover.extend(collect_image_paths(r))
         test_secret = []
         for r in secret_roots:
             test_secret.extend(collect_image_paths(r))
-    data_cfg = config.get("data", {})
+        test_secret = sorted(test_secret)
     bs = batch_size or data_cfg.get("batch_size", 8)
     num_workers = data_cfg.get("num_workers", 4)
-    img_size = data_cfg.get("image_size", 256)
     secret_size = data_cfg.get("secret_size", 256)
-    dataset = StegoPairPathDataset(test_cover, test_secret, img_size, secret_size, max_samples=None)
+    dataset = ImagePathsDataset(test_secret, secret_size, is_cover=False)
     return DataLoader(dataset, batch_size=bs, shuffle=False, num_workers=num_workers, drop_last=False)
 
 
