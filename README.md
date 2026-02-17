@@ -1,12 +1,12 @@
 # GenMamba-Flow: Robust Generative Steganography
 
-基于解耦 Mamba 流与干扰流形引导的鲁棒**无载体**生成式隐写术。生成器采用 **DiS 类架构**（Patch + 三流 Mamba 序列），支持 **多卡训练/测试**，**单脚本** 完成训练与测试，并带 **完整可视化**（损失曲线、隐写对比、指标图、鲁棒性曲线、消融对比）。训练与测试均为**无载体**：仅用秘密图生成隐写图，无需独立载体图。
+基于解耦 Mamba 流与干扰流形引导的鲁棒**无载体**生成式隐写术。生成器采用 **DiS 类架构**（Patch + **并行**三流 Mamba 序列），支持 **多卡训练/测试**，**单脚本** 完成训练与测试，并带 **完整可视化**（损失曲线、隐写对比、指标图、鲁棒性曲线、消融对比）。训练与测试均为**无载体**：仅用秘密图生成隐写图，无需独立载体图。
 
 ## 创新点
 
-1. **内生鲁棒性**：干扰流形引导的生成对抗传输，在 Rectified Flow 轨迹中引入对抗性梯度，生成即防御。
-2. **高保真性**：语义-结构-纹理三流 Mamba 解耦 + rSMI 约束，隐写仅改局部纹理，保留语义与结构。
-3. **高还原度**：RQ-VAE 残差离散化 + 语义辅助硬负样本对比解码，实现分级完美重建。
+1. **内生鲁棒性**：干扰流形引导的生成与传输；**生成即防御**在 **ODE 采样器** 层面实现——默认使用 **Predictor-Corrector** 纠错采样（Euler + Langevin 式 Corrector），而非在直线插值轨迹上做手脚。
+2. **高保真性**：语义-结构-纹理 **真并行** 三流 Mamba 解耦 + **正交损失**（Orthogonal Loss）约束，使结构流与纹理流互不干扰（正交），隐写仅改局部纹理，保留语义与结构。
+3. **高还原度**：RQ-VAE 残差量化作为特征瓶颈 + **连续域解码损失**（L1/平滑 L1 + 可选 FFT 频域），避免纯离散索引分类带来的级联崩溃；可选语义辅助硬负样本对比（hDCE）进一步强化解码。
 
 ## 环境
 
@@ -25,9 +25,9 @@ pip install -r requirements.txt
 
 支持任意图像目录结构（递归收集 `.jpg/.png` 等）。本实现为**无载体隐写**：训练 Stage2 与测试均仅使用秘密图像，生成隐写图不依赖独立载体图。
 
-## 生成器架构：DiS
+## 生成器架构：DiS + 并行三流 Mamba
 
-生成器为 **类 DiS**（Diffusion with State Space）：Patch 嵌入 + 时间/文本嵌入 + 一串三流 Mamba 块 + 线性输出为速度场，无 U-Net 多尺度。配置见 `configs/default.yaml` 中 `generator`：`patch_size`、`num_layers`、`img_size` 等。
+生成器为 **类 DiS**（Diffusion with State Space）：Patch 嵌入 + 时间/文本嵌入 + 一串 **并行三流 Mamba 块** + 线性输出为速度场，无 U-Net 多尺度。每个块内 **语义 / 结构 / 纹理** 三路 **并行** 独立计算（`h_sem = SSM_sem(x, c_txt)`、`h_struc = SSM_struc(x)`、`h_tex = SSM_tex(x) ⊕ M(f_sec)`），再拼接后经线性融合与残差得到下一层输入；结构流与纹理流用于 **正交损失**，确保二者表示互不干扰。配置见 `configs/default.yaml` 中 `generator`：`patch_size`、`num_layers`、`img_size` 等。
 
 ## 训练（单脚本、多卡 DDP）
 
@@ -49,11 +49,13 @@ python train.py --config configs/default.yaml --override configs/train.yaml
 
 **训练阶段可视化**（自动写入 `outputs/vis/`）：
 
-- **损失曲线**：`loss_curves.png` / `loss_curves_final.png`（loss_flow, loss_align, loss_robust, loss_dec）
+- **损失曲线**：`loss_curves.png` / `loss_curves_final.png`（loss_flow, loss_align 正交, loss_robust 连续解码, loss_dec）
 - **损失历史**：`loss_history.json` 供后续重绘
 - **隐写对比图**：每隔 `project.vis_every` 步保存 cover / stego / secret / recovered 四宫格 `stego_step*.png`
 
 配置项：`project.vis_every`、`project.log_every`、`project.save_every`。
+
+**解码与采样**：解码器同时输出离散索引 logits（推理/可选 hDCE）与 **连续特征**（各深度 `(B, C, H', W')`），训练时以 **ContinuousRobustDecodingLoss**（连续 L1 + 频域）为主，量化作为瓶颈。采样时 `sample()` 默认委托 **Predictor-Corrector**（`sample_pc`），可通过 `num_steps`、`corrector_steps`、`snr` 调节。
 
 ## 测试与评估（单脚本、多卡）
 
@@ -114,7 +116,7 @@ GenMamba-Flow/
 ├── configs/             # 默认/训练/消融配置
 ├── data/                # 数据与 DataLoader（含 DDP 采样）
 ├── models/              # RQ-VAE, DiS, Rectified Flow, Decoder, Interference
-├── losses/              # rSMI, Robust Decoding, hDCE
+├── losses/              # Orthogonal/FeatureDecorrelation, ContinuousRobustDecoding, hDCE
 ├── utils/               # 指标、可视化（vis_plots）、配置加载
 ├── scripts/             # 可视化脚本、消融入口
 ├── train.py             # 训练入口（DDP + 阶段内可视化）
