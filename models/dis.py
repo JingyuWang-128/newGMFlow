@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .mamba_blocks import SelectiveSSM
-from .tri_stream_mamba import TriStreamBlock, timestep_embed, SecretModulation
+from .tri_stream_mamba import ParallelTriStreamBlock, timestep_embed, SecretModulation
 
 
 class PatchEmbed(nn.Module):
@@ -50,7 +50,7 @@ class FinalLayer(nn.Module):
 class TriStreamDiS(nn.Module):
     """
     类 DiS 主干：PatchEmbed -> [t_embed + c_embed 加在首 token 或广播] -> N x TriStreamBlock -> FinalLayer.
-    输出 v (B,3,H,W) 与 all_struc, all_tex 用于 rSMI。
+    输出 v (B,3,H,W) 与 all_struc, all_tex 用于正交/去相关损失。
     """
 
     def __init__(
@@ -84,7 +84,7 @@ class TriStreamDiS(nn.Module):
         self.time_embed_input_dim = model_channels
         self.text_proj = nn.Linear(text_embed_dim, model_channels)
         self.blocks = nn.ModuleList([
-            TriStreamBlock(model_channels, d_state, d_conv, expand, secret_embed_dim, text_embed_dim, use_mamba_ssm=use_mamba_ssm)
+            ParallelTriStreamBlock(model_channels, d_state, d_conv, expand, secret_embed_dim, text_embed_dim, use_mamba_ssm=use_mamba_ssm)
             for _ in range(num_layers)
         ])
         self.norm_out = nn.LayerNorm(model_channels)
@@ -124,11 +124,11 @@ class TriStreamDiS(nn.Module):
 
         all_struc, all_tex = [], []
         for blk in self.blocks:
-            # TriStreamBlock 接受 (B,L,C) 或 (B,C,H,W)；这里传入序列，内部会做 2D 变换做 mod
-            h_struc_2d, h_tex_2d = blk(x_seq, f_sec, c_txt)
+            # ParallelTriStreamBlock 返回 (x_out, h_struc_2d, h_tex_2d)，用 x_out 作为下一层输入
+            x_out, h_struc_2d, h_tex_2d = blk(x_seq, f_sec, c_txt)
             all_struc.append(h_struc_2d)
             all_tex.append(h_tex_2d)
-            x_seq = rearrange(h_tex_2d, "b c h w -> b (h w) c")
+            x_seq = x_out if x_out.dim() == 3 else rearrange(x_out, "b c h w -> b (h w) c")
         x_seq = self.norm_out(x_seq)
         v = self.final_layer(x_seq, self.h, self.w)
         return v, all_struc, all_tex

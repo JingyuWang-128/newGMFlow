@@ -1,11 +1,12 @@
 # GenMamba-Flow losses
 
-from .alignment import rSMIAlignmentLoss
-from .robust import RobustDecodingLoss
+from .alignment import OrthogonalLoss, FeatureDecorrelationLoss
+from .robust import ContinuousRobustDecodingLoss
 from .contrastive import hDCELoss
 
 __all__ = [
-    "rSMIAlignmentLoss",
-    "RobustDecodingLoss",
+    "OrthogonalLoss",
+    "FeatureDecorrelationLoss",
+    "ContinuousRobustDecodingLoss",
     "hDCELoss",
 ]
