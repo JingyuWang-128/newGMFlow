@@ -5,6 +5,7 @@ GenMamba-Flow 训练脚本（单脚本完成全部阶段，支持多卡 DDP）
 """
 
 import argparse
+import datetime
 import os
 import random
 import sys
@@ -372,7 +373,8 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if world_size > 1:
-        dist.init_process_group(backend="nccl")
+        # Stage1 仅 rank0 跑 RQ-VAE 预训练，其他 rank 在 barrier 处等待，需将 NCCL 超时设长于 Stage1 耗时（如 6 小时）
+        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=6))
         device = torch.device("cuda", local_rank)
         try:
             torch.cuda.set_device(device)

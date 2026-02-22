@@ -1,5 +1,8 @@
 #!/bin/bash
 # GenMamba-Flow 训练：单脚本执行全部阶段，自动使用当前机器所有 GPU（DDP）
+# 说明：Stage1 仅 rank0 跑 RQ-VAE，其他卡在 barrier 等待；已设置 6 小时 NCCL 超时。若仍超时，可先单卡跑完 Stage1 再多卡跑 Stage2：
+#   STAGE=1 python train.py --config ... --stage 1
+#   STAGE=2 torchrun --nproc_per_node=N train.py --config ... --stage 2
 set -e
 cd "$(dirname "$0")"
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
