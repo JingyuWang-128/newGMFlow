@@ -7,6 +7,7 @@ GenMamba-Flow 训练脚本（单脚本完成全部阶段，支持多卡 DDP）
 import argparse
 import datetime
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import random
 import sys
 from pathlib import Path
@@ -41,12 +42,19 @@ def set_seed(seed: int):
 
 
 def get_text_encoder(config, device):
-    dim = config.get("generator", {}).get("text_embed_dim", 768)
+    config_dim = config.get("generator", {}).get("text_embed_dim", 512)
+    dim = config_dim
     try:
         import open_clip
         model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
         model = model.to(device).eval()
         tokenizer = open_clip.get_tokenizer("ViT-B-32")
+        # ViT-B-32 文本编码输出为 512 维，须与 generator.text_embed_dim 一致
+        with torch.no_grad():
+            actual_dim = model.encode_text(tokenizer(["dummy"]).to(device)).shape[-1]
+        if actual_dim != config_dim and device.type == "cuda":
+            import warnings
+            warnings.warn("Text encoder output dim %d != config text_embed_dim %d; set config to %d to match ViT-B-32." % (actual_dim, config_dim, actual_dim), UserWarning)
         def encode(text_list):
             with torch.no_grad():
                 t = tokenizer(text_list).to(device)
@@ -54,9 +62,9 @@ def get_text_encoder(config, device):
         return encode, dim
     except Exception:
         class PlaceholderTextEncoder(nn.Module):
-            def __init__(self, dim):
+            def __init__(self, d):
                 super().__init__()
-                self.embed = nn.Embedding(1000, dim)
+                self.embed = nn.Embedding(1000, d)
             def forward(self, text_list):
                 B = len(text_list)
                 return self.embed(torch.randint(0, 1000, (B,), device=next(self.parameters()).device))
@@ -77,7 +85,7 @@ def build_backbone(config):
         d_state=gen_cfg.get("d_state", 16),
         d_conv=gen_cfg.get("d_conv", 4),
         expand=gen_cfg.get("expand", 2),
-        text_embed_dim=gen_cfg.get("text_embed_dim", 768),
+        text_embed_dim=gen_cfg.get("text_embed_dim", 512),
         secret_embed_dim=gen_cfg.get("secret_embed_dim", 256),
         use_mamba_ssm=gen_cfg.get("use_mamba_ssm", True),
     )

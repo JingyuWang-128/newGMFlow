@@ -47,7 +47,8 @@ generator:
   d_state: 16
   d_conv: 4
   expand: 2
-  text_embed_dim: 768
+  # 须与文本编码器输出一致：OpenCLIP ViT-B-32 为 512 维，ViT-L/14 等为 768 维
+  text_embed_dim: 512
   secret_embed_dim: 256
   num_flow_steps: 1000
   # 使用官方 mamba_ssm 的 Mamba（已安装 mamba-ssm）；设为 false 则退回纯 PyTorch Selective SSM

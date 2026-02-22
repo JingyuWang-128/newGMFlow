@@ -64,7 +64,7 @@ class TriStreamDiS(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
-        text_embed_dim: int = 768,
+        text_embed_dim: int = 512,
         secret_embed_dim: int = 256,
         use_mamba_ssm: bool = True,
     ):

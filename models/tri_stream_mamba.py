@@ -96,9 +96,9 @@ class ParallelTriStreamBlock(nn.Module):
         self.tex_ssm = _build_ssm(dim, d_state, d_conv, expand, use_mamba_ssm)
         self.secret_mod = SecretModulation(secret_dim, dim)
         
-        # 特征融合层
+        # 特征融合层：拼接后最后一维为 dim*3，LayerNorm 须与之一致
         self.fusion = nn.Linear(dim * 3, dim)
-        self.fusion_norm = nn.LayerNorm(dim)
+        self.fusion_norm = nn.LayerNorm(dim * 3)
 
     def forward(self, x: torch.Tensor, f_sec: torch.Tensor, c_txt: torch.Tensor = None):
         """

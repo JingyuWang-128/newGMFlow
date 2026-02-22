@@ -6,6 +6,7 @@ GenMamba-Flow 测试与评估脚本（单脚本跑全部分析，支持多卡）
 import argparse
 import json
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from pathlib import Path
 
 import torch
