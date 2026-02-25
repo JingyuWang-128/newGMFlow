@@ -8,7 +8,8 @@ project:
   vis_every: 1000
 
 data:
-  batch_size: 8
+  # Stage2 显存大：DiS 18 层 Mamba + 256×256，48GB 单卡建议 2～4，24GB 建议 1～2
+  batch_size: 1
   num_workers: 4
   split_ratios: [0.8, 0.1, 0.1]
   split_seed: 42
@@ -42,7 +43,7 @@ generator:
   patch_size: 4
   in_channels: 3
   out_channels: 3
-  model_channels: 384
+  model_channels: 384  # 48GB 单卡 batch=1 可跑；512 易 OOM
   num_layers: 18
   d_state: 16
   d_conv: 4
@@ -65,7 +66,7 @@ rq_vae:
   channel_mult: [1, 2, 2, 4]
   num_res: 3
 
-# 鲁棒解码器：加深加宽
+# 鲁棒解码器（hidden_dim 384 约 48GB 可跑；512 需梯度检查点或更大显存）
 decoder:
   in_channels: 3
   hidden_dim: 384

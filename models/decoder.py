@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 import math
 
@@ -19,11 +20,15 @@ class DecoderBackbone(nn.Module):
 
     def __init__(self, in_channels: int = 3, hidden_dim: int = 256, num_layers: int = 4, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
+        # 三次 stride=2：256→128→64→32，序列长 32*32=1024，避免 64*64=4096 时 SSM 反向 48GB OOM
         self.conv_in = nn.Sequential(
             nn.Conv2d(in_channels, hidden_dim // 2, 3, stride=2, padding=1),
             nn.GroupNorm(8, hidden_dim // 2),
             nn.SiLU(),
             nn.Conv2d(hidden_dim // 2, hidden_dim, 3, stride=2, padding=1),
+            nn.GroupNorm(8, hidden_dim),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1),
             nn.GroupNorm(8, hidden_dim),
             nn.SiLU(),
         )
@@ -40,7 +45,9 @@ class DecoderBackbone(nn.Module):
         _, _, h, w = x.shape
         x = rearrange(x, "b c h w -> b (h w) c")
         for layer in self.ssm_layers:
-            x = x + layer[1](layer[0](x))
+            def ssm_block(z: torch.Tensor) -> torch.Tensor:
+                return layer[1](layer[0](z))
+            x = x + checkpoint(ssm_block, x, use_reentrant=False)
         return x, h, w
 
 
@@ -117,6 +124,12 @@ class RobustDecoder(nn.Module):
             连续列表用于 L1/L2/感知等解码损失，避免纯离散索引的级联崩溃。
         """
         feat, h, w = self.backbone(x)
+        if feat.dim() == 4:
+            # SelectiveSSM 4D 兼容时可能返回 (B,L,L,C)，压成 (B, L, C)
+            feat = feat[:, : h * w, :].contiguous()
+        # 强制 3D，防止 checkpoint/DDP 或缓存导致仍为 4D
+        if feat.dim() != 3:
+            feat = feat[:, : h * w, :].contiguous()
         latent_h, latent_w = max(1, x.shape[2] // 16), max(1, x.shape[3] // 16)
         feat_2d = rearrange(feat, "b (h w) c -> b c h w", h=h, w=w)
         feat_2d = F.adaptive_avg_pool2d(feat_2d, (latent_h, latent_w))
@@ -136,3 +149,4 @@ class RobustDecoder(nn.Module):
         """返回每层 argmax 索引 (B, H', W')."""
         logits_list, _ = self.forward(x)
         return [logits.argmax(dim=-1) for logits in logits_list]
+

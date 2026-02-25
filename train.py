@@ -49,7 +49,6 @@ def get_text_encoder(config, device):
         model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
         model = model.to(device).eval()
         tokenizer = open_clip.get_tokenizer("ViT-B-32")
-        # ViT-B-32 文本编码输出为 512 维，须与 generator.text_embed_dim 一致
         with torch.no_grad():
             actual_dim = model.encode_text(tokenizer(["dummy"]).to(device)).shape[-1]
         if actual_dim != config_dim and device.type == "cuda":
@@ -73,7 +72,6 @@ def get_text_encoder(config, device):
 
 
 def build_backbone(config):
-    """根据 config 构建 DiS 主干（更深/更宽以提升隐写与重建能力）。"""
     gen_cfg = config.get("generator", {})
     return TriStreamDiS(
         img_size=gen_cfg.get("img_size", 256),
@@ -126,7 +124,6 @@ def build_models(config, device, use_ddp: bool = False, rank: int = 0):
 
 
 def train_rq_vae(rq_vae, dataloader, config, device, save_dir, rank: int = 0):
-    """阶段1：预训练 RQ-VAE（仅 rank0 执行并保存）。"""
     if rank != 0:
         return
     train_cfg = config.get("train", {})
@@ -158,7 +155,6 @@ def train_rq_vae(rq_vae, dataloader, config, device, save_dir, rank: int = 0):
 
 
 def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=None, stage: str = "all"):
-    """stage: 1=仅RQ-VAE, 2=仅生成器+解码器, all=两阶段都跑。"""
     proj = config.get("project", {})
     save_dir = Path(proj.get("output_dir", "./outputs"))
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -381,7 +377,6 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if world_size > 1:
-        # Stage1 仅 rank0 跑 RQ-VAE 预训练，其他 rank 在 barrier 处等待，需将 NCCL 超时设长于 Stage1 耗时（如 6 小时）
         dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=6))
         device = torch.device("cuda", local_rank)
         try:

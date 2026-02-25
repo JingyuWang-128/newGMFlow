@@ -42,7 +42,7 @@ class SelectiveSSM(nn.Module):
 
         self.in_proj = nn.Linear(d_model, self.d_inner * 2)
         self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, d_conv, padding=d_conv - 1, groups=self.d_inner)
-        self.x_proj = nn.Linear(self.d_inner, d_state * 2 + self.d_inner)
+        self.x_proj = nn.Linear(self.d_inner, self.d_inner * 2 + d_state)
         self.dt_proj = nn.Linear(self.d_inner, self.d_inner)
         self.out_proj = nn.Linear(self.d_inner, d_model)
 
@@ -61,12 +61,18 @@ class SelectiveSSM(nn.Module):
             bt = B[:, t, :]
             ct = C[:, t, :]
             h = h * (1 - dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0).to(u.dtype))
-            h = h + dt.unsqueeze(-1) * bt.unsqueeze(-1) * ut.unsqueeze(-1)
-            yt = (h * ct.unsqueeze(-2)).sum(-1) + self.D.to(u.dtype) * ut
+            h = h + (dt * ut).unsqueeze(-1) * bt.unsqueeze(-2)
+            yt = (h * ct.unsqueeze(-1)).sum(-1) + self.D.to(u.dtype) * ut
             outs.append(yt)
         return torch.stack(outs, dim=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 3:
+            # 兼容 checkpoint/DDP 等可能产生的 4D 输入，压成 (B', L, D)
+            orig_shape = x.shape
+            x = x.reshape(-1, x.size(-2), x.size(-1))
+        else:
+            orig_shape = None
         B, L, D = x.shape
         xz = self.in_proj(x)
         x, z = xz.chunk(2, dim=-1)
@@ -79,7 +85,12 @@ class SelectiveSSM(nn.Module):
         delta = F.softplus(self.dt_proj(delta))
         A = -torch.exp(self.A_log.view(self.d_inner, self.d_state))
         h = self._selective_scan_approx(x, delta, A, B_sel, C_sel)
-        return self.out_proj(h * F.silu(z))
+        out = self.out_proj(h * F.silu(z))
+        if orig_shape is not None:
+            # 不恢复 4D，只返回 (B, L, D)，避免 decoder 收到 4D 导致 rearrange 报错
+            B_orig = orig_shape[0]
+            out = out[:B_orig]
+        return out
 
 
 class MambaBlock(nn.Module):

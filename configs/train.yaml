@@ -8,7 +8,8 @@ project:
   vis_every: 1000
 
 data:
-  batch_size: 16
+  # 覆盖时勿设过大，否则 Stage2 易 OOM（48GB 卡建议 2～4）
+  batch_size: 1
   num_workers: 8
   split_seed: 42
 

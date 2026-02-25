@@ -66,7 +66,6 @@ class BlurOperator(nn.Module):
         kernel = kernel / kernel.sum()
         kernel = kernel.view(1, 1, -1).expand(3, 1, -1)
         kernel_2d = kernel.unsqueeze(-1) * kernel.unsqueeze(-2)
-        kernel_2d = kernel_2d.view(1, 3, k, k)
         padding = k // 2
         return F.conv2d(x, kernel_2d, padding=padding, groups=3)
 

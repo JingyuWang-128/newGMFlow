@@ -88,6 +88,13 @@ torchrun --nproc_per_node=4 train.py --config configs/default.yaml --override co
   - 损失历史：`loss_history.json`
   - 隐写对比：`stego_step*.png`（cover / stego / secret / recovered）
 
+**显存不足（OOM）**：Stage2 的 DiS（18 层 Mamba、256×256）较吃显存。若报 `CUDA out of memory`：
+- 将 `data.batch_size` 调小（如改为 `2` 或 `1`），或
+- 在 override 中减小 `generator.model_channels`（如 256）、`generator.num_layers`（如 12），或
+- 减小 `decoder.hidden_dim`（默认 384；512 时 decoder 已开梯度检查点，仍 OOM 可改回 384），或
+- 设置环境变量：`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 缓解碎片。  
+默认 `batch_size: 1`、`decoder.hidden_dim: 384`，约 48GB 单卡可跑；24GB 卡建议 `batch_size: 1` 且 generator/decoder 用更小维度。
+
 ---
 
 ## 二、测试
