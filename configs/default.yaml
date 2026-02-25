@@ -76,6 +76,8 @@ decoder:
   expand: 2
   num_rq_depths: 4
   num_embeddings: 8192
+  # 使用官方 mamba_ssm 加速；设为 false 则退回纯 PyTorch Selective SSM
+  use_mamba_ssm: true
 
 loss:
   # 正交损失（结构/纹理互不干扰），替代已废弃的 rSMI 对齐

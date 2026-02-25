@@ -115,6 +115,7 @@ def build_models(config, device, use_ddp: bool = False, rank: int = 0):
         num_rq_depths=dec_cfg.get("num_rq_depths", 4),
         num_embeddings=dec_cfg.get("num_embeddings", 8192),
         latent_channels=rq_cfg.get("latent_channels", 256),
+        use_mamba_ssm=dec_cfg.get("use_mamba_ssm", True),
     ).to(device)
     interference = InterferenceManifold(config.get("interference", {})).to(device)
     if use_ddp:
@@ -285,7 +286,7 @@ def train_main(config, device, rank: int = 0, world_size: int = 1, resume_path=N
             opt_gen.zero_grad()
             if scaler:
                 scaler.scale(L_gen).backward()
-                scaler.unscale_(opt_gen, None)
+                scaler.unscale_(opt_gen)
                 torch.nn.utils.clip_grad_norm_(flow_module.parameters(), grad_clip)
                 scaler.step(opt_gen)
             else:

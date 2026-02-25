@@ -159,16 +159,14 @@ class CrossScan(nn.Module):
 
 
 class Mamba2DBlock(nn.Module):
-    """2D 特征上的 Mamba 块：Cross-Scan + Mamba + 残差。"""
+    """2D 特征上的 Mamba 块：Mamba + 残差（可选官方 mamba_ssm 加速）。"""
 
-    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2, use_mamba_ssm: bool = True):
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.ssm = SelectiveSSM(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.scan = CrossScan(merge=True)
+        self.block = MambaBlock(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand, use_mamba_ssm=use_mamba_ssm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         x_flat = rearrange(x, "b c h w -> b (h w) c")
-        x_flat = x_flat + self.ssm(self.norm(x_flat))
+        x_flat = self.block(x_flat)
         return rearrange(x_flat, "b (h w) c -> b c h w", h=H, w=W)
