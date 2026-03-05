@@ -254,7 +254,9 @@ def train(config: Dict[str, Any], resume_path: str | None = None) -> None:
 
     dataloader = get_train_dataloader(config)
     state = TrainState()
-    lambda_secret = float(train_cfg.get("lambda_secret", 1.0))
+    warmup_steps_lambda = int(train_cfg.get("warmup_steps_lambda", 2000))
+    rampup_steps_lambda = int(train_cfg.get("rampup_steps_lambda", 3000))
+    target_lambda_secret = float(train_cfg.get("lambda_secret", 1.0))
     max_grad_norm = float(train_cfg.get("max_grad_norm", 1.0))
     log_every = int(train_cfg.get("log_every", 50))
     save_every = int(train_cfg.get("save_every", 1000))
@@ -339,9 +341,17 @@ def train(config: Dict[str, Any], resume_path: str | None = None) -> None:
             z_noise = torch.randn_like(z_cover)  # [B, 4, H/8, W/8]
             z_noisy, v_target = flow_matching_target(z_cover, z_noise, t)  # both [B, 4, H/8, W/8]
 
+            if state.global_step < warmup_steps_lambda:
+                current_lambda_secret = 0.0
+            elif state.global_step < warmup_steps_lambda + rampup_steps_lambda:
+                ratio = (state.global_step - warmup_steps_lambda) / float(max(1, rampup_steps_lambda))
+                current_lambda_secret = target_lambda_secret * ratio
+            else:
+                current_lambda_secret = target_lambda_secret
+
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=scaler.is_enabled()):
-                v_pred = generator(z_noisy, text_cond=None, secret_cond=z_secret)  # [B, 4, H/8, W/8]
+                v_pred = generator(z_noisy, t=t, text_cond=None, secret_cond=z_secret)  # [B, 4, H/8, W/8]
                 l_gen = F.mse_loss(v_pred, v_target)
 
                 t_view = t.view(-1, 1, 1, 1)
@@ -353,7 +363,7 @@ def train(config: Dict[str, Any], resume_path: str | None = None) -> None:
                 z_secret_pred = decoder(z_attacked)  # [B, 4, H/8, W/8]
                 l_secret = F.mse_loss(z_secret_pred, z_secret)
 
-                l_total = l_gen + lambda_secret * l_secret
+                l_total = l_gen + current_lambda_secret * l_secret
 
             non_finite_reason = None
             if not torch.isfinite(v_pred).all():
@@ -434,6 +444,7 @@ def train(config: Dict[str, Any], resume_path: str | None = None) -> None:
                     "loss": float(l_total.detach().item()),
                     "l_gen": float(l_gen.detach().item()),
                     "l_secret": float(l_secret.detach().item()),
+                    "lambda": float(current_lambda_secret),
                     "grad_norm": grad_norm_value,
                     "lr": lr,
                     "detach": int(detach_flag),
@@ -443,13 +454,16 @@ def train(config: Dict[str, Any], resume_path: str | None = None) -> None:
                 }
                 _append_jsonl(log_path, log_item)
                 pbar.set_postfix(
-                    step=state.global_step,
-                    loss=float(l_total.detach().item()),
-                    l_gen=float(l_gen.detach().item()),
-                    l_secret=float(l_secret.detach().item()),
-                    detach=int(detach_flag),
-                    lr=f"{lr:.2e}",
-                    gnorm=f"{grad_norm_value:.3f}",
+                    {
+                        "step": state.global_step,
+                        "loss": float(l_total.detach().item()),
+                        "l_gen": float(l_gen.detach().item()),
+                        "l_secret": float(l_secret.detach().item()),
+                        "lambda": float(current_lambda_secret),
+                        "detach": int(detach_flag),
+                        "lr": f"{lr:.2e}",
+                        "gnorm": f"{grad_norm_value:.3f}",
+                    }
                 )
 
             if state.global_step % save_every == 0:

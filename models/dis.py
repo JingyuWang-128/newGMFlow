@@ -9,6 +9,20 @@ from torch.utils.checkpoint import checkpoint
 from .stego_mamba_block import LatentStegoDiSBlock
 
 
+def get_timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+    """Create sinusoidal timestep embeddings. timesteps shape: [B]."""
+    if timesteps.ndim != 1:
+        raise ValueError(f"timesteps must be 1D [B], got shape {tuple(timesteps.shape)}.")
+    half = dim // 2
+    device = timesteps.device
+    freqs = torch.exp(-torch.log(torch.tensor(float(max_period), device=device)) * torch.arange(half, device=device) / max(half, 1))
+    args = timesteps.float().unsqueeze(1) * freqs.unsqueeze(0)  # [B, half]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # [B, 2*half]
+    if dim % 2 == 1:
+        emb = torch.cat([emb, emb.new_zeros((emb.size(0), 1))], dim=-1)
+    return emb
+
+
 def haar_dwt2d(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Differentiable 2D Haar DWT: returns (LL, LH, HL, HH)."""
     if x.ndim != 4:
@@ -110,6 +124,17 @@ class TriStreamLatentDiS(nn.Module):
         self.tex_out_norm = nn.LayerNorm(dim)
         self.sem_out_proj = nn.Linear(dim, in_channels)
         self.tex_out_proj = nn.Linear(dim, in_channels * 3)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(dim, dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(dim, dim, bias=True),
+        )
+        if text_dim is None:
+            self.text_global_proj = None
+        elif text_dim == dim:
+            self.text_global_proj = nn.Identity()
+        else:
+            self.text_global_proj = nn.Linear(text_dim, dim)
 
     @staticmethod
     def _to_seq(x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
@@ -129,16 +154,17 @@ class TriStreamLatentDiS(nn.Module):
         block: LatentStegoDiSBlock,
         h_sem: torch.Tensor,
         h_tex: torch.Tensor,
+        c_global: torch.Tensor,
         text_cond: Optional[torch.Tensor],
         secret_seq: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.use_checkpoint and self.training:
             def custom_forward(sem: torch.Tensor, tex: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-                return block(sem, tex, text_cond=text_cond, secret_seq=secret_seq)
+                return block(sem, tex, c_global=c_global, text_cond=text_cond, secret_seq=secret_seq)
 
             return checkpoint(custom_forward, h_sem, h_tex, use_reentrant=False)
 
-        return block(h_sem, h_tex, text_cond=text_cond, secret_seq=secret_seq)
+        return block(h_sem, h_tex, c_global=c_global, text_cond=text_cond, secret_seq=secret_seq)
 
     def _prepare_secret_seq(
         self, secret_cond: Optional[torch.Tensor], target_len: int
@@ -170,6 +196,7 @@ class TriStreamLatentDiS(nn.Module):
     def forward(
         self,
         z_noisy: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
         text_cond: Optional[torch.Tensor] = None,
         secret_cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -184,13 +211,37 @@ class TriStreamLatentDiS(nn.Module):
         h_tex = self.tex_in_proj(h_tex)  # [B, H/2*W/2, dim]
         secret_seq = self._prepare_secret_seq(secret_cond, target_len=h_sem.size(1))  # [B, H/2*W/2, secret_dim]
 
+        # Build global condition c from timestep (and optional text condition).
+        bsz = z_noisy.size(0)
+        if t is None:
+            t = z_noisy.new_zeros((bsz,))
+        if t.ndim == 0:
+            t = t.expand(bsz)
+        elif t.ndim == 2 and t.size(1) == 1:
+            t = t.squeeze(1)
+        elif t.ndim != 1:
+            raise ValueError(f"t must be [B] or [B,1], got shape {tuple(t.shape)}.")
+        if t.size(0) != bsz:
+            raise ValueError(f"t batch mismatch: got {t.size(0)}, expected {bsz}.")
+
+        t_emb = get_timestep_embedding(t * 1000.0, self.dim).to(device=z_noisy.device, dtype=h_sem.dtype)  # [B, dim]
+        c_global = self.time_mlp(t_emb)  # [B, dim]
+        if text_cond is not None and self.text_global_proj is not None:
+            if text_cond.ndim == 3:
+                text_global = text_cond.mean(dim=1)  # [B, text_dim]
+            elif text_cond.ndim == 2:
+                text_global = text_cond
+            else:
+                raise ValueError(f"text_cond must be [B, D] or [B, L, D], got {tuple(text_cond.shape)}.")
+            c_global = c_global + self.text_global_proj(text_global).to(dtype=c_global.dtype)  # [B, dim]
+
         # 2) Macro dual-track long skip connection.
         skip_sem: list[torch.Tensor] = []
         skip_tex: list[torch.Tensor] = []
 
         for i, block in enumerate(self.blocks):
             if i < self.half_depth:
-                h_sem, h_tex = self._run_block(block, h_sem, h_tex, text_cond, secret_seq)  # both [B, HW/4, dim]
+                h_sem, h_tex = self._run_block(block, h_sem, h_tex, c_global, text_cond, secret_seq)  # both [B, HW/4, dim]
                 skip_sem.append(h_sem)
                 skip_tex.append(h_tex)
                 continue
@@ -198,7 +249,7 @@ class TriStreamLatentDiS(nn.Module):
             skip_idx = i - self.half_depth
             h_sem = self.skip_fuse_sem[skip_idx](torch.cat([skip_sem.pop(), h_sem], dim=-1))  # [B, HW/4, 2dim] -> [B, HW/4, dim]
             h_tex = self.skip_fuse_tex[skip_idx](torch.cat([skip_tex.pop(), h_tex], dim=-1))  # [B, HW/4, 2dim] -> [B, HW/4, dim]
-            h_sem, h_tex = self._run_block(block, h_sem, h_tex, text_cond, secret_seq)  # both [B, HW/4, dim]
+            h_sem, h_tex = self._run_block(block, h_sem, h_tex, c_global, text_cond, secret_seq)  # both [B, HW/4, dim]
 
         # 3) Sequence -> 2D and IDWT reconstruction to full latent velocity field.
         ll_seq = self.sem_out_proj(self.sem_out_norm(h_sem))  # [B, HW/4, C]

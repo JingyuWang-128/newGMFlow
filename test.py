@@ -168,7 +168,7 @@ def embed_stego_latent(
     t_view = t.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
     z_noise = torch.randn_like(z_cover)  # [B, 4, H/8, W/8]
     z_noisy = (1.0 - t_view) * z_cover + t_view * z_noise  # [B, 4, H/8, W/8]
-    v_pred = generator(z_noisy, text_cond=None, secret_cond=z_secret)  # [B, 4, H/8, W/8]
+    v_pred = generator(z_noisy, t=t, text_cond=None, secret_cond=z_secret)  # [B, 4, H/8, W/8]
     z_stego = z_noisy - t_view * v_pred  # [B, 4, H/8, W/8]
     return z_stego
 

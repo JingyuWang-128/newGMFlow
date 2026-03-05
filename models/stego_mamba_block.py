@@ -73,12 +73,21 @@ class LatentStegoDiSBlock(nn.Module):
         self.tex_to_z = nn.Linear(dim, dim)
         self.secret_to_x = nn.Linear(secret_dim, dim)
         self.secret_to_z = nn.Linear(secret_dim, dim)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 3 * dim, bias=True),
+        )
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
         self.dropout = nn.Dropout(dropout)
+        self.alpha_x = nn.Parameter(torch.tensor(0.01))
+        self.alpha_z = nn.Parameter(torch.tensor(0.01))
 
     def forward(
         self,
         h_sem: torch.Tensor,
         h_tex: torch.Tensor,
+        c_global: torch.Tensor,
         text_cond: Optional[torch.Tensor] = None,
         secret_seq: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -90,6 +99,12 @@ class LatentStegoDiSBlock(nn.Module):
             raise ValueError(
                 f"h_sem and h_tex must share shape, got {tuple(h_sem.shape)} vs {tuple(h_tex.shape)}."
             )
+        if c_global.ndim != 2:
+            raise ValueError(f"c_global must be [B, C], got shape {tuple(c_global.shape)}.")
+        if c_global.size(0) != h_sem.size(0):
+            raise ValueError(f"c_global batch mismatch: got {c_global.size(0)}, expected {h_sem.size(0)}.")
+        if c_global.size(1) != self.dim:
+            raise ValueError(f"c_global channel mismatch: got {c_global.size(1)}, expected {self.dim}.")
 
         bsz, seq_len, _ = h_sem.shape
 
@@ -101,8 +116,15 @@ class LatentStegoDiSBlock(nn.Module):
             text_seq = _align_seq_length(text_cond, target_len=seq_len)  # [B, L, text_dim] or [B, L, C]
             sem_in = sem_in + self.text_proj(text_seq)  # [B, L, C]
 
-        sem_hidden = self.sem_mamba(self.sem_norm(sem_in))  # [B, L, C] -> [B, L, C]
-        h_sem_out = h_sem + self.dropout(sem_hidden)  # [B, L, C]
+        # adaLN-Zero modulation for semantic stream.
+        shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c_global).chunk(3, dim=-1)  # each [B, C]
+        shift_msa = shift_msa.unsqueeze(1)  # [B, 1, C]
+        scale_msa = scale_msa.unsqueeze(1)  # [B, 1, C]
+        gate_msa = gate_msa.unsqueeze(1)  # [B, 1, C]
+        normed_sem = self.sem_norm(sem_in)  # [B, L, C]
+        sem_in_modulated = normed_sem * (1 + scale_msa) + shift_msa  # [B, L, C]
+        sem_hidden = self.sem_mamba(sem_in_modulated)  # [B, L, C]
+        h_sem_out = h_sem + gate_msa * sem_hidden  # [B, L, C]
 
         # 2) Cross-gating from semantic stream.
         mask = torch.sigmoid(self.mask_proj(h_sem_out))  # [B, L, C]
@@ -114,8 +136,11 @@ class LatentStegoDiSBlock(nn.Module):
 
         if secret_seq is not None:
             secret_seq = _align_seq_length(secret_seq, target_len=seq_len)  # [B, L, secret_dim]
-            x = x + self.secret_to_x(secret_seq)  # [B, L, C]
-            z = z + self.secret_to_z(secret_seq)  # [B, L, C]
+            # Use tanh to cap energy and apply tiny learnable injection scales.
+            x_delta = torch.tanh(self.secret_to_x(secret_seq))
+            z_delta = torch.tanh(self.secret_to_z(secret_seq))
+            x = x + self.alpha_x * x_delta  # [B, L, C]
+            z = z + self.alpha_z * z_delta  # [B, L, C]
 
         # Stabilize mixed-precision training: avoid Inf*0 -> NaN in gated product.
         z = torch.clamp(z, min=-30.0, max=30.0)
