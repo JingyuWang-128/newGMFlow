@@ -32,13 +32,13 @@ model:
 
 train:
   epochs: 1
-  lr: 1e-4
+  lr: 5e-5
   min_lr_ratio: 0.1
   warmup_steps: 500
   weight_decay: 1e-2
   lambda_secret: 1.0
   max_grad_norm: 1.0
-  amp: true
+  amp: false
   use_checkpoint: true
   detach_for_robust: true
   detach_warmup_steps: 100000

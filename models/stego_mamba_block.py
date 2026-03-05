@@ -117,7 +117,11 @@ class LatentStegoDiSBlock(nn.Module):
             x = x + self.secret_to_x(secret_seq)  # [B, L, C]
             z = z + self.secret_to_z(secret_seq)  # [B, L, C]
 
-        h_tex_out = self.tex_mamba(x) * F.silu(z) * mask  # [B, L, C]
+        # Stabilize mixed-precision training: avoid Inf*0 -> NaN in gated product.
+        z = torch.clamp(z, min=-30.0, max=30.0)
+        z_gate = torch.nan_to_num(F.silu(z), nan=0.0, posinf=1e4, neginf=-1e4)
+        tex_hidden = torch.nan_to_num(self.tex_mamba(x), nan=0.0, posinf=1e4, neginf=-1e4)
+        h_tex_out = torch.nan_to_num(tex_hidden * z_gate * mask, nan=0.0, posinf=1e4, neginf=-1e4)  # [B, L, C]
 
         # 4) Keep frequency streams physically isolated.
         return h_sem_out, h_tex_out

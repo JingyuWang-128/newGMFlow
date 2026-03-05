@@ -195,7 +195,7 @@ def save_checkpoint(
     return ckpt_path
 
 
-def train(config: Dict[str, Any]) -> None:
+def train(config: Dict[str, Any], resume_path: str | None = None) -> None:
     train_cfg = config["train"]
     model_cfg = config["model"]
     attack_cfg = config["attack"]
@@ -274,22 +274,58 @@ def train(config: Dict[str, Any]) -> None:
     decoder.train()
     interference.train()
 
-    start_time = time.time()
-    _append_jsonl(
-        log_path,
-        {
-            "event": "train_start",
-            "time": datetime.now().isoformat(timespec="seconds"),
-            "device": str(device),
-            "total_steps": total_steps,
-            "config": config,
-        },
-    )
+    if resume_path:
+        ckpt = torch.load(resume_path, map_location=device)
+        generator.load_state_dict(ckpt["generator"])
+        decoder.load_state_dict(ckpt["decoder"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+        ckpt_state = ckpt.get("state", {})
+        state.epoch = int(ckpt_state.get("epoch", 0))
+        state.global_step = int(ckpt_state.get("global_step", 0))
+        print(f"[Resume] loaded checkpoint: {resume_path} (global_step={state.global_step})")
 
-    pbar = tqdm(total=epochs * len(dataloader), desc="Latent-DiS-Stego Training", dynamic_ncols=True)
+    start_step = state.global_step
+    start_time = time.time()
+    if state.global_step == 0:
+        _append_jsonl(
+            log_path,
+            {
+                "event": "train_start",
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "device": str(device),
+                "total_steps": total_steps,
+                "config": config,
+            },
+        )
+    else:
+        _append_jsonl(
+            log_path,
+            {
+                "event": "train_resume",
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "device": str(device),
+                "resume_path": resume_path,
+                "global_step": state.global_step,
+                "total_steps": total_steps,
+            },
+        )
+
+    pbar = tqdm(
+        total=total_steps,
+        initial=min(state.global_step, total_steps),
+        desc="Latent-DiS-Stego Training",
+        dynamic_ncols=True,
+    )
     for epoch in range(epochs):
         state.epoch = epoch
         for batch in dataloader:
+            if state.global_step >= total_steps:
+                break
             cover = batch["cover"].to(device, non_blocking=True)
             secret = batch["secret"].to(device, non_blocking=True)
 
@@ -319,9 +355,65 @@ def train(config: Dict[str, Any]) -> None:
 
                 l_total = l_gen + lambda_secret * l_secret
 
+            non_finite_reason = None
+            if not torch.isfinite(v_pred).all():
+                non_finite_reason = "v_pred_non_finite"
+            elif not torch.isfinite(z_attacked).all():
+                non_finite_reason = "z_attacked_non_finite"
+            elif not torch.isfinite(z_secret_pred).all():
+                non_finite_reason = "z_secret_pred_non_finite"
+            elif not torch.isfinite(l_gen):
+                non_finite_reason = "l_gen_non_finite"
+            elif not torch.isfinite(l_secret):
+                non_finite_reason = "l_secret_non_finite"
+            elif not torch.isfinite(l_total):
+                non_finite_reason = "l_total_non_finite"
+
+            if non_finite_reason is not None:
+                optimizer.zero_grad(set_to_none=True)
+                if scaler.is_enabled():
+                    scaler.update()
+                scheduler.step()
+                state.global_step += 1
+                pbar.update(1)
+                _append_jsonl(
+                    log_path,
+                    {
+                        "event": "non_finite_skip",
+                        "epoch": state.epoch,
+                        "step": state.global_step,
+                        "reason": non_finite_reason,
+                        "lr": _current_lr(optimizer),
+                        "time": datetime.now().isoformat(timespec="seconds"),
+                    },
+                )
+                continue
+
             scaler.scale(l_total).backward()
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+            grad_norm_value = float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+
+            if not math.isfinite(grad_norm_value):
+                optimizer.zero_grad(set_to_none=True)
+                if scaler.is_enabled():
+                    scaler.update()
+                scheduler.step()
+                state.global_step += 1
+                pbar.update(1)
+                _append_jsonl(
+                    log_path,
+                    {
+                        "event": "non_finite_skip",
+                        "epoch": state.epoch,
+                        "step": state.global_step,
+                        "reason": "grad_norm_non_finite",
+                        "lr": _current_lr(optimizer),
+                        "time": datetime.now().isoformat(timespec="seconds"),
+                    },
+                )
+                continue
+
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -331,7 +423,8 @@ def train(config: Dict[str, Any]) -> None:
 
             if state.global_step % log_every == 0:
                 elapsed = time.time() - start_time
-                steps_per_sec = state.global_step / max(1e-6, elapsed)
+                effective_steps = max(1, state.global_step - start_step)
+                steps_per_sec = effective_steps / max(1e-6, elapsed)
                 eta_sec = (total_steps - state.global_step) / max(1e-6, steps_per_sec)
                 lr = _current_lr(optimizer)
                 log_item = {
@@ -341,7 +434,7 @@ def train(config: Dict[str, Any]) -> None:
                     "loss": float(l_total.detach().item()),
                     "l_gen": float(l_gen.detach().item()),
                     "l_secret": float(l_secret.detach().item()),
-                    "grad_norm": float(grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm),
+                    "grad_norm": grad_norm_value,
                     "lr": lr,
                     "detach": int(detach_flag),
                     "steps_per_sec": steps_per_sec,
@@ -356,7 +449,7 @@ def train(config: Dict[str, Any]) -> None:
                     l_secret=float(l_secret.detach().item()),
                     detach=int(detach_flag),
                     lr=f"{lr:.2e}",
-                    gnorm=f"{float(grad_norm):.3f}",
+                    gnorm=f"{grad_norm_value:.3f}",
                 )
 
             if state.global_step % save_every == 0:
@@ -371,6 +464,8 @@ def train(config: Dict[str, Any]) -> None:
                     },
                 )
                 tqdm.write(f"[Checkpoint] saved to {ckpt_path}")
+        if state.global_step >= total_steps:
+            break
 
     pbar.close()
     final_ckpt = save_checkpoint(save_dir, state, generator, decoder, optimizer, scheduler, scaler, config)
@@ -391,6 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Latent-DiS-Stego.")
     parser.add_argument("--config", type=str, default=None, help="Path to yaml config.")
     parser.add_argument("--dump-default-config", type=str, default=None, help="Dump default config json path.")
+    parser.add_argument("--resume", type=str, default=None, help="Resume training from checkpoint path.")
     return parser.parse_args()
 
 
@@ -405,4 +501,4 @@ if __name__ == "__main__":
         print(f"Default config written to: {dump_path}")
     else:
         cfg = load_config(args.config)
-        train(cfg)
+        train(cfg, resume_path=args.resume)
