@@ -4,5 +4,6 @@ losses/__pycache__/
 models/__pycache__/
 utils/__pycache__/
 outputs/
+checkpoints_full/
 __pycache__/
 README.md

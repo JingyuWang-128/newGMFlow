@@ -1,208 +1,352 @@
-"""
-GenMamba-Flow 测试与评估脚本（单脚本跑全部分析，支持多卡）
-评估：Bit Accuracy、Recovery PSNR/SSIM、鲁棒性曲线；全部结果可视化并保存。
-"""
+from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from pathlib import Path
+from typing import Any, Dict, Iterable
 
 import torch
-import torch.nn as nn
-import numpy as np
+import torch.nn.functional as F
+from PIL import Image
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torchvision.transforms import functional as TF
+from torchvision.utils import save_image
 
-from utils.config import get_config
-from data.datasets import get_train_dataloader, get_test_dataloader
-from models.rq_vae import RQVAE
-from models.rectified_flow import RectifiedFlowGenerator
-from models.decoder import RobustDecoder
-from models.interference import InterferenceManifold
-from utils.metrics import compute_psnr_ssim, compute_bit_accuracy
-from utils.visualization import save_stego_comparison, save_recovery_grid, save_depth_recovery
-from utils.vis_plots import plot_metrics_bars, plot_robustness_curves
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
 
+# Use mirror endpoint for any Hugging Face downloads.
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-def build_models(config, device, use_multi_gpu: bool = False):
-    from train import build_models as _build
-    rq_vae, flow, decoder, interference = _build(config, device, use_ddp=False)
-    if use_multi_gpu and torch.cuda.device_count() > 1:
-        flow = nn.DataParallel(flow)
-        decoder = nn.DataParallel(decoder)
-    return rq_vae, flow, decoder, interference
+from data.datasets import get_test_dataloader, get_val_dataloader
+from models.continuous_vae import ContinuousVAE
+from models.decoder import ResMambaSecretDecoder
+from models.dis import TriStreamLatentDiS
+from utils.metrics import LPIPSMetric, MetricAverager, psnr, ssim, to_01
 
 
-def load_checkpoint(config, device, ckpt_path: str, use_multi_gpu: bool = False):
-    rq_vae, flow, decoder, _ = build_models(config, device, use_multi_gpu=use_multi_gpu)
-    ckpt = torch.load(ckpt_path, map_location=device)
-    if "rq_vae" in ckpt:
-        rq_vae.load_state_dict(ckpt["rq_vae"])
-    if "flow" in ckpt:
-        (flow.module if isinstance(flow, nn.DataParallel) else flow).load_state_dict(ckpt["flow"])
-    if "decoder" in ckpt:
-        (decoder.module if isinstance(decoder, nn.DataParallel) else decoder).load_state_dict(ckpt["decoder"])
-    return rq_vae, flow, decoder
-
-
-def _flow_sample(flow, shape, f_sec, c_txt, num_steps, device):
-    m = flow.module if isinstance(flow, nn.DataParallel) else flow
-    return m.sample(shape, f_sec, c_txt, num_steps=num_steps, device=device)
-
-
-def _decoder_predict_indices(decoder, x):
-    m = decoder.module if isinstance(decoder, nn.DataParallel) else decoder
-    return m.predict_indices(x)
-
-
-def run_eval(config, device, ckpt_path: str, output_dir: str, num_batches: int = 20, use_multi_gpu: bool = False):
-    rq_vae, flow, decoder = load_checkpoint(config, device, ckpt_path, use_multi_gpu)
-    rq_vae.eval()
-    flow.eval()
-    decoder.eval()
-    from data.datasets import print_split_stats
-    print_split_stats(config)
-    dataloader = get_test_dataloader(config)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    all_ba = []
-    all_psnr = []
-    all_ssim = []
-    from train import get_text_encoder
-    text_encoder, _ = get_text_encoder(config, device)
-    num_steps_sample = config.get("generator", {}).get("num_flow_steps", 1000)
-    num_steps_sample = min(32, num_steps_sample)
-
-    for bi, batch in enumerate(tqdm(dataloader, total=num_batches, desc="Eval")):
-        if bi >= num_batches:
-            break
-        secret = batch["secret"].to(device)
-        B = secret.shape[0]
-        texts = ["a natural image"] * B
-        if isinstance(texts, str):
-            texts = [texts] * B
-        with torch.no_grad():
-            indices_list = rq_vae.get_indices(secret)
-            f_sec = rq_vae.encode(secret)
-            _, _, qlist, _ = rq_vae.quantize_residual(f_sec)
-            f_sec = sum(qlist)
-            c_txt = text_encoder(texts)
-            if c_txt.dim() == 1:
-                c_txt = c_txt.unsqueeze(0)
-            stego = _flow_sample(flow, secret.shape, f_sec, c_txt, num_steps_sample, device)
-            pred_indices = _decoder_predict_indices(decoder, stego)
-            recovered = rq_vae.decode_from_indices(pred_indices)
-        ba = compute_bit_accuracy(pred_indices, indices_list)
-        psnr, ssim = compute_psnr_ssim(recovered, secret)
-        all_ba.append(ba)
-        all_psnr.append(psnr)
-        all_ssim.append(ssim)
-
-        if bi < 5:
-            save_stego_comparison(
-                None, stego, secret, recovered,
-                str(output_dir / f"compare_batch{bi}.png"),
-                nrow=min(4, B),
-            )
-            save_recovery_grid(secret, recovered, str(output_dir / f"recovery_batch{bi}.png"), nrow=4)
-            save_depth_recovery(rq_vae, pred_indices, str(output_dir / f"depth_recovery_batch{bi}.png"), depth_steps=[1, 2, 3, 4])
-
-    metrics = {
-        "Bit Accuracy": float(np.mean(all_ba)),
-        "Recovery PSNR": float(np.mean(all_psnr)),
-        "Recovery SSIM": float(np.mean(all_ssim)),
+def _default_config() -> Dict[str, Any]:
+    return {
+        "data": {
+            "batch_size": 4,
+            "num_workers": 4,
+            "image_size": 256,
+            "secret_size": 256,
+        },
+        "model": {
+            "vae_model_name": "stabilityai/sd-vae-ft-mse",
+            "latent_channels": 4,
+            "generator_dim": 512,
+            "generator_depth": 12,
+            "generator_d_state": 16,
+            "generator_d_conv": 4,
+            "generator_expand": 2,
+            "generator_dropout": 0.0,
+            "secret_dim": 512,
+            "decoder_dim": 384,
+            "decoder_layers": 4,
+            "decoder_d_state": 16,
+            "decoder_d_conv": 4,
+            "decoder_expand": 2,
+            "decoder_dropout": 0.0,
+            "text_dim": None,
+        },
+        "test": {
+            "seed": 42,
+            "num_samples": 200,
+            "batch_size": 4,
+            "t_embed": 0.5,
+            "save_dir": "eval_outputs",
+            "vis_max_per_attack": 20,
+            "split": "val",  # val: has cover+secret; test: secret only
+        },
     }
-    print("Bit Accuracy:", metrics["Bit Accuracy"])
-    print("Recovery PSNR:", metrics["Recovery PSNR"])
-    print("Recovery SSIM:", metrics["Recovery SSIM"])
-    with open(output_dir / "metrics.txt", "w", encoding="utf-8") as f:
-        for k, v in metrics.items():
-            f.write(f"{k}: {v}\n")
-    with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-    plot_metrics_bars(metrics, str(output_dir / "metrics_bars.png"), title="Evaluation Metrics")
-    return metrics
 
 
-def run_robustness_curves(config, device, ckpt_path: str, output_dir: str, use_multi_gpu: bool = False):
-    rq_vae, flow, decoder = load_checkpoint(config, device, ckpt_path, use_multi_gpu)
-    rq_vae.eval()
-    flow.eval()
-    decoder.eval()
-    interference = InterferenceManifold(config.get("interference", {}))
-    dataloader = get_test_dataloader(config)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_update(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
 
-    jpeg_qualities = [30, 50, 70, 90]
-    results = {str(q): [] for q in jpeg_qualities}
-    from train import get_text_encoder
-    text_encoder, _ = get_text_encoder(config, device)
-    for batch in tqdm(list(dataloader)[:15], desc="Robustness"):
-        secret = batch["secret"].to(device)
-        B = secret.shape[0]
-        texts = ["a natural image"] * B
-        with torch.no_grad():
-            indices_list = rq_vae.get_indices(secret)
-            f_sec = rq_vae.encode(secret)
-            _, _, qlist, _ = rq_vae.quantize_residual(f_sec)
-            f_sec = sum(qlist)
-            c_txt = text_encoder(texts)
-            stego = _flow_sample(flow, secret.shape, f_sec, c_txt, 16, device)
-        for q in jpeg_qualities:
-            stego_jpeg = interference.jpeg_op(stego, quality=q)
-            if stego_jpeg.device != device:
-                stego_jpeg = stego_jpeg.to(device)
-            with torch.no_grad():
-                pred = _decoder_predict_indices(decoder, stego_jpeg)
-            ba = compute_bit_accuracy(pred, indices_list)
-            results[str(q)].append(ba)
-    mean_results = {q: float(np.mean(results[str(q)])) for q in jpeg_qualities}
-    for q in jpeg_qualities:
-        print(f"JPEG Q{q}: BA = {mean_results[q]}")
-    with open(output_dir / "robustness_jpeg.txt", "w", encoding="utf-8") as f:
-        for q in jpeg_qualities:
-            f.write(f"JPEG Q{q}: {mean_results[q]}\n")
-    with open(output_dir / "robustness_jpeg.json", "w", encoding="utf-8") as f:
-        json.dump(mean_results, f, indent=2)
-    plot_robustness_curves(
-        {"GenMamba-Flow": [mean_results[q] for q in jpeg_qualities]},
-        [str(q) for q in jpeg_qualities],
-        str(output_dir / "robustness_jpeg_curve.png"),
-        ylabel="Bit Accuracy",
-        title="Robustness under JPEG Compression",
+
+def load_config(config_path: str | None) -> Dict[str, Any]:
+    cfg = _default_config()
+    if config_path is None:
+        return cfg
+    if yaml is None:
+        raise ImportError("PyYAML is required to load config files. Please install `pyyaml`.")
+    with open(config_path, "r", encoding="utf-8") as f:
+        user_cfg = yaml.safe_load(f) or {}
+    return _deep_update(cfg, user_cfg)
+
+
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _jpeg_attack(x_01: torch.Tensor, quality: int = 50) -> torch.Tensor:
+    """Apply deterministic JPEG compression on [0,1] tensor image batch."""
+    outs = []
+    for i in range(x_01.size(0)):
+        pil_img = TF.to_pil_image(x_01[i].cpu())
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=quality)
+        buf.seek(0)
+        jpeg_img = Image.open(buf).convert("RGB")
+        outs.append(TF.to_tensor(jpeg_img))
+    return torch.stack(outs, dim=0).to(device=x_01.device, dtype=x_01.dtype)
+
+
+def attack_clean(x_m11: torch.Tensor) -> torch.Tensor:
+    return x_m11
+
+
+def attack_crop_center_05(x_m11: torch.Tensor) -> torch.Tensor:
+    bsz, _, h, w = x_m11.shape
+    ch = max(1, int(round(h * 0.5)))
+    cw = max(1, int(round(w * 0.5)))
+    top = (h - ch) // 2
+    left = (w - cw) // 2
+    cropped = x_m11[:, :, top : top + ch, left : left + cw]
+    return F.interpolate(cropped, size=(h, w), mode="bilinear", align_corners=False)
+
+
+def attack_jpeg_q50(x_m11: torch.Tensor) -> torch.Tensor:
+    x_01 = to_01(x_m11)
+    out = _jpeg_attack(x_01, quality=50)
+    return out.mul(2.0).sub(1.0).clamp(-1.0, 1.0)
+
+
+def attack_gaussian_blur_sigma2(x_m11: torch.Tensor) -> torch.Tensor:
+    x_01 = to_01(x_m11)
+    import kornia.filters as KF
+
+    y_01 = KF.gaussian_blur2d(x_01, kernel_size=(9, 9), sigma=(2.0, 2.0))
+    return y_01.mul(2.0).sub(1.0).clamp(-1.0, 1.0)
+
+
+def attack_noise_std01(x_m11: torch.Tensor) -> torch.Tensor:
+    x_01 = to_01(x_m11)
+    noise = torch.randn_like(x_01) * 0.1
+    y_01 = (x_01 + noise).clamp(0.0, 1.0)
+    return y_01.mul(2.0).sub(1.0).clamp(-1.0, 1.0)
+
+
+def build_attack_pool() -> Dict[str, Any]:
+    return {
+        "Clean": attack_clean,
+        "Crop(0.5)": attack_crop_center_05,
+        "JPEG(Q=50)": attack_jpeg_q50,
+        "GaussianBlur(sigma=2.0)": attack_gaussian_blur_sigma2,
+        "Noise(std=0.1)": attack_noise_std01,
+    }
+
+
+@torch.no_grad()
+def embed_stego_latent(
+    generator: TriStreamLatentDiS,
+    z_cover: torch.Tensor,
+    z_secret: torch.Tensor,
+    t_embed: float = 0.5,
+) -> torch.Tensor:
+    """
+    One-step latent embedding used in evaluation:
+      z_noisy = (1-t) * z_cover + t * N(0, I)
+      v_pred  = G(z_noisy, secret=z_secret)
+      z_stego = z_noisy - t * v_pred
+    """
+    t = torch.full((z_cover.size(0),), fill_value=t_embed, device=z_cover.device, dtype=z_cover.dtype)  # [B]
+    t_view = t.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
+    z_noise = torch.randn_like(z_cover)  # [B, 4, H/8, W/8]
+    z_noisy = (1.0 - t_view) * z_cover + t_view * z_noise  # [B, 4, H/8, W/8]
+    v_pred = generator(z_noisy, text_cond=None, secret_cond=z_secret)  # [B, 4, H/8, W/8]
+    z_stego = z_noisy - t_view * v_pred  # [B, 4, H/8, W/8]
+    return z_stego
+
+
+def _iter_batches(dataloader: DataLoader, split: str) -> Iterable[Dict[str, torch.Tensor]]:
+    for batch in dataloader:
+        if split == "val":
+            yield {"cover": batch["cover"], "secret": batch["secret"]}
+        else:
+            # test split may only provide secrets, so use zeros as cover proxy.
+            secret = batch["secret"]
+            cover = torch.zeros_like(secret)
+            yield {"cover": cover, "secret": secret}
+
+
+def evaluate(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    test_cfg = cfg["test"]
+    model_cfg = cfg["model"]
+    set_seed(int(test_cfg.get("seed", 42)))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    save_dir = Path(test_cfg.get("save_dir", "eval_outputs"))
+    vis_dir = save_dir / "visualizations"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    vae = ContinuousVAE(
+        model_name=model_cfg["vae_model_name"],
+        device=device,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else None,
     )
-    return mean_results
+    generator = TriStreamLatentDiS(
+        in_channels=model_cfg["latent_channels"],
+        dim=model_cfg["generator_dim"],
+        depth=model_cfg["generator_depth"],
+        text_dim=model_cfg.get("text_dim"),
+        secret_dim=model_cfg["secret_dim"],
+        d_state=model_cfg["generator_d_state"],
+        d_conv=model_cfg["generator_d_conv"],
+        expand=model_cfg["generator_expand"],
+        dropout=model_cfg["generator_dropout"],
+        use_checkpoint=False,
+    ).to(device)
+    decoder = ResMambaSecretDecoder(
+        in_channels=model_cfg["latent_channels"],
+        out_channels=model_cfg["latent_channels"],
+        dim=model_cfg["decoder_dim"],
+        num_layers=model_cfg["decoder_layers"],
+        d_state=model_cfg["decoder_d_state"],
+        d_conv=model_cfg["decoder_d_conv"],
+        expand=model_cfg["decoder_expand"],
+        dropout=model_cfg["decoder_dropout"],
+    ).to(device)
 
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    generator.load_state_dict(ckpt["generator"], strict=True)
+    decoder.load_state_dict(ckpt["decoder"], strict=True)
+    generator.eval()
+    decoder.eval()
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--override", default=None)
-    parser.add_argument("--checkpoint", default="outputs/final.pt")
-    parser.add_argument("--output_dir", default="outputs/eval")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--num_batches", type=int, default=20)
-    parser.add_argument("--multi_gpu", action="store_true", help="Use all available GPUs (DataParallel)")
-    parser.add_argument("--robustness_only", action="store_true")
-    args = parser.parse_args()
-    config = get_config(args.config, args.override)
-    device = torch.device(args.device)
-    use_multi_gpu = args.multi_gpu and torch.cuda.device_count() > 1
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.robustness_only:
-        run_robustness_curves(config, device, args.checkpoint, args.output_dir, use_multi_gpu)
+    split = str(test_cfg.get("split", "val"))
+    batch_size = int(args.batch_size or test_cfg.get("batch_size", cfg["data"]["batch_size"]))
+    if split == "val":
+        dataloader = get_val_dataloader(cfg, batch_size=batch_size)
     else:
-        metrics = run_eval(config, device, args.checkpoint, args.output_dir, args.num_batches, use_multi_gpu)
-        robustness = run_robustness_curves(config, device, args.checkpoint, args.output_dir, use_multi_gpu)
-        with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
-            json.dump({"metrics": metrics, "robustness_jpeg": robustness}, f, indent=2)
-        print("All results and figures saved to", output_dir)
+        dataloader = get_test_dataloader(cfg, batch_size=batch_size)
+
+    attack_pool = build_attack_pool()
+    attack_meters = {name: MetricAverager() for name in attack_pool}
+    carrier_meter = MetricAverager()
+    lpips_metric = LPIPSMetric(device=device, net=args.lpips_net)
+    vis_max = int(test_cfg.get("vis_max_per_attack", 20))
+    vis_count = {name: 0 for name in attack_pool}
+
+    num_samples = int(args.num_samples or test_cfg.get("num_samples", 200))
+    t_embed = float(args.t_embed or test_cfg.get("t_embed", 0.5))
+    seen = 0
+
+    pbar = tqdm(total=num_samples, desc="Robustness Evaluation", dynamic_ncols=True)
+    for batch in _iter_batches(dataloader, split=split):
+        if seen >= num_samples:
+            break
+
+        cover = batch["cover"].to(device, non_blocking=True)
+        secret_gt = batch["secret"].to(device, non_blocking=True)
+        bsz = cover.size(0)
+        keep = min(bsz, num_samples - seen)
+        cover = cover[:keep]
+        secret_gt = secret_gt[:keep]
+
+        with torch.no_grad():
+            z_cover = vae.encode_to_latent(cover, sample_posterior=False)  # [B, 3, H, W] -> [B, 4, H/8, W/8]
+            z_secret_gt = vae.encode_to_latent(secret_gt, sample_posterior=False)  # [B, 3, H, W] -> [B, 4, H/8, W/8]
+
+            # Stego generation in latent, then decode to carrier pixel space.
+            z_stego = embed_stego_latent(generator, z_cover, z_secret_gt, t_embed=t_embed)  # [B, 4, H/8, W/8]
+            stego_img = vae.decode_from_latent(z_stego)  # [B, 3, H, W]
+
+        # Carrier quality on clean stego.
+        cover_01 = to_01(cover)
+        stego_01 = to_01(stego_img)
+        carrier_meter.update(
+            {
+                "carrier_psnr": psnr(stego_01, cover_01),
+                "carrier_ssim": ssim(stego_01, cover_01),
+            },
+            n=keep,
+        )
+
+        # Attack loop and extraction pipeline.
+        for attack_name, attack_fn in attack_pool.items():
+            attacked_stego = attack_fn(stego_img)  # [B, 3, H, W]
+
+            with torch.no_grad():
+                z_attacked = vae.encode_to_latent(attacked_stego, sample_posterior=False)  # [B, 4, H/8, W/8]
+                z_secret_pred = decoder(z_attacked)  # [B, 4, H/8, W/8]
+                secret_rec = vae.decode_from_latent(z_secret_pred)  # [B, 3, H, W]
+
+            secret_gt_01 = to_01(secret_gt)
+            secret_rec_01 = to_01(secret_rec)
+            metrics = {
+                "psnr": psnr(secret_rec_01, secret_gt_01),
+                "ssim": ssim(secret_rec_01, secret_gt_01),
+                "lpips": lpips_metric(secret_rec_01, secret_gt_01),
+            }
+            attack_meters[attack_name].update(metrics, n=keep)
+
+            # Visualization: [secret_gt | stego_clean | attacked_stego | secret_rec]
+            can_save = vis_count[attack_name] < vis_max
+            if can_save:
+                for i in range(keep):
+                    if vis_count[attack_name] >= vis_max:
+                        break
+                    panel = torch.cat(
+                        [
+                            secret_gt[i : i + 1],
+                            stego_img[i : i + 1],
+                            attacked_stego[i : i + 1],
+                            secret_rec[i : i + 1],
+                        ],
+                        dim=-1,
+                    )
+                    out_path = vis_dir / f"{attack_name.replace('/', '_')}_{vis_count[attack_name]:04d}.png"
+                    save_image(to_01(panel), str(out_path))
+                    vis_count[attack_name] += 1
+
+        seen += keep
+        pbar.update(keep)
+    pbar.close()
+
+    results = {
+        "checkpoint": str(args.checkpoint),
+        "num_samples": seen,
+        "lpips_available": lpips_metric.available,
+        "carrier_quality": carrier_meter.compute(),
+        "attacks": {name: meter.compute() for name, meter in attack_meters.items()},
+        "visualizations_dir": str(vis_dir),
+    }
+
+    result_path = save_dir / "metrics.json"
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+    print(json.dumps(results, indent=2, ensure_ascii=False))
+    print(f"[Saved] metrics: {result_path}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Latent-DiS-Stego robustness evaluation.")
+    parser.add_argument("--config", type=str, default=None, help="Path to yaml config.")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint.")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override test batch size.")
+    parser.add_argument("--num-samples", type=int, default=None, help="Override evaluated sample count.")
+    parser.add_argument("--t-embed", type=float, default=None, help="Override one-step latent embed t.")
+    parser.add_argument("--lpips-net", type=str, default="alex", choices=["alex", "vgg", "squeeze"])
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    evaluate(parse_args())

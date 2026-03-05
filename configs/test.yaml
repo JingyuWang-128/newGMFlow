@@ -1,0 +1,54 @@
+data:
+  batch_size: 1
+  num_workers: 0
+  image_size: 256
+  secret_size: 256
+  num_train_samples: 8
+
+model:
+  vae_model_name: stabilityai/sd-vae-ft-mse
+  latent_channels: 4
+  generator_dim: 256
+  generator_depth: 8
+  generator_d_state: 16
+  generator_d_conv: 4
+  generator_expand: 2
+  generator_dropout: 0.0
+  secret_dim: 256
+  decoder_dim: 256
+  decoder_layers: 4
+  decoder_d_state: 16
+  decoder_d_conv: 4
+  decoder_expand: 2
+  decoder_dropout: 0.0
+  text_dim: null
+
+train:
+  epochs: 1
+  lr: 1e-4
+  weight_decay: 1e-2
+  lambda_secret: 1.0
+  max_grad_norm: 1.0
+  amp: true
+  use_checkpoint: true
+  detach_for_robust: true
+  detach_warmup_steps: 100000
+  save_dir: checkpoints_smoke
+  save_every: 1
+  log_every: 1
+  seed: 42
+
+attack:
+  identity_prob: 0.2
+  noise_std: 0.03
+  jpeg_quality: [40.0, 90.0]
+  latent_hw: [32, 32]
+
+test:
+  seed: 42
+  num_samples: 2
+  batch_size: 1
+  t_embed: 0.5
+  save_dir: eval_outputs_smoke
+  vis_max_per_attack: 2
+  split: val
