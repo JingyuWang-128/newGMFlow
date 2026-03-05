@@ -1,0 +1,55 @@
+data:
+  cover_roots:
+    - ./data/placeholder/DIV2K
+  secret_roots:
+    - ./data/placeholder/Paris_StreetView
+  split_file: ./data/splits.json
+  split_ratios: [0.8, 0.1, 0.1]
+  split_seed: 42
+  batch_size: 2
+  num_workers: 4
+  image_size: 256
+  secret_size: 256
+  num_train_samples: 20000
+
+model:
+  vae_model_name: stabilityai/sd-vae-ft-mse
+  latent_channels: 4
+  generator_dim: 512
+  generator_depth: 12
+  generator_d_state: 16
+  generator_d_conv: 4
+  generator_expand: 2
+  generator_dropout: 0.0
+  secret_dim: 512
+  decoder_dim: 384
+  decoder_layers: 6
+  decoder_d_state: 16
+  decoder_d_conv: 4
+  decoder_expand: 2
+  decoder_dropout: 0.0
+  text_dim: null
+
+train:
+  epochs: 1
+  lr: 5e-5
+  min_lr_ratio: 0.1
+  warmup_steps: 500
+  weight_decay: 1e-2
+  lambda_secret: 1.0
+  max_grad_norm: 1.0
+  amp: false
+  use_checkpoint: true
+  detach_for_robust: true
+  detach_warmup_steps: 100000
+  save_dir: checkpoints_full
+  save_every: 500
+  log_every: 20
+  log_file: train_metrics.jsonl
+  seed: 42
+
+attack:
+  identity_prob: 0.2
+  noise_std: 0.03
+  jpeg_quality: [40.0, 90.0]
+  latent_hw: [32, 32]

@@ -1,81 +1,94 @@
-"""
-评估指标：FID, CLIP Score, Stego-LPIPS, Bit Accuracy, Recovery PSNR/SSIM, 隐写分析检测率
-"""
+from __future__ import annotations
 
-from typing import List, Optional
+import math
+from dataclasses import dataclass, field
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
-import numpy as np
+
+try:
+    import kornia.metrics as kmetrics
+except ImportError:  # pragma: no cover
+    kmetrics = None
 
 
-def compute_psnr_ssim(pred: torch.Tensor, target: torch.Tensor, data_range: float = 2.0) -> tuple:
-    """pred/target: (B,3,H,W) in [-1,1]. Returns (psnr_mean, ssim_mean)."""
-    pred = (pred + 1) / 2
-    target = (target + 1) / 2
-    mse = F.mse_loss(pred, target, reduction="none").mean(dim=[1, 2, 3])
-    psnr = (10 * torch.log10(data_range ** 2 / (mse + 1e-8))).mean().item()
-    ssim_val = _ssim_batch(pred, target, data_range=1.0)
-    return psnr, ssim_val
+def to_01(x: torch.Tensor) -> torch.Tensor:
+    """Convert image tensor from [-1, 1] to [0, 1]."""
+    return x.add(1.0).mul(0.5).clamp(0.0, 1.0)
 
 
-def _ssim_batch(x: torch.Tensor, y: torch.Tensor, window_size: int = 11, data_range: float = 1.0) -> float:
-    C = x.shape[1]
-    w = _gaussian_window(window_size, C, x.device)
-    mu_x = F.conv2d(x, w, padding=window_size // 2, groups=C)
-    mu_y = F.conv2d(y, w, padding=window_size // 2, groups=C)
-    mu_x_sq = mu_x ** 2
-    mu_y_sq = mu_y ** 2
-    mu_xy = mu_x * mu_y
-    sigma_x_sq = F.conv2d(x * x, w, padding=window_size // 2, groups=C) - mu_x_sq
-    sigma_y_sq = F.conv2d(y * y, w, padding=window_size // 2, groups=C) - mu_y_sq
-    sigma_xy = F.conv2d(x * y, w, padding=window_size // 2, groups=C) - mu_xy
-    c1, c2 = 0.01 ** 2, 0.03 ** 2
-    ssim = (2 * mu_xy + c1) * (2 * sigma_xy + c2) / ((mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2))
-    return ssim.mean().item()
+@torch.no_grad()
+def psnr(x: torch.Tensor, y: torch.Tensor, data_range: float = 1.0, eps: float = 1e-12) -> float:
+    """Compute batch PSNR for [B, C, H, W] tensors."""
+    mse = F.mse_loss(x, y, reduction="mean")
+    if mse.item() <= eps:
+        return float("inf")
+    return float(10.0 * torch.log10(torch.tensor((data_range**2) / mse.item(), device=x.device)).item())
 
 
-def _gaussian_window(size: int, channels: int, device: torch.device) -> torch.Tensor:
-    sigma = 1.5
-    coords = torch.arange(size, device=device).float() - size // 2
-    g = torch.exp(-coords ** 2 / (2 * sigma ** 2))
-    g = g / g.sum()
-    w = g.unsqueeze(0).unsqueeze(0).expand(channels, 1, size, size)
-    return w
+@torch.no_grad()
+def ssim(x: torch.Tensor, y: torch.Tensor, data_range: float = 1.0, window_size: int = 11) -> float:
+    """Compute batch SSIM; prefers kornia implementation when available."""
+    if kmetrics is not None:
+        score_map = kmetrics.ssim(x, y, window_size=window_size, max_val=data_range)
+        return float(score_map.mean().item())
+
+    # Fallback global SSIM approximation when kornia is unavailable.
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+    mu_x = x.mean(dim=(-1, -2), keepdim=True)
+    mu_y = y.mean(dim=(-1, -2), keepdim=True)
+    sigma_x = ((x - mu_x) ** 2).mean(dim=(-1, -2), keepdim=True)
+    sigma_y = ((y - mu_y) ** 2).mean(dim=(-1, -2), keepdim=True)
+    sigma_xy = ((x - mu_x) * (y - mu_y)).mean(dim=(-1, -2), keepdim=True)
+    ssim_map = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / (
+        (mu_x**2 + mu_y**2 + c1) * (sigma_x + sigma_y + c2)
+    )
+    return float(ssim_map.mean().item())
 
 
-def compute_bit_accuracy(pred_indices: List[torch.Tensor], target_indices: List[torch.Tensor]) -> float:
-    """pred/target: 每层 (B, H', W'). 返回平均 token 准确率。"""
-    total = 0
-    correct = 0
-    for p, t in zip(pred_indices, target_indices):
-        mask = t >= 0
-        total += mask.sum().item()
-        correct += ((p == t) & mask).sum().item()
-    return correct / max(total, 1)
+class LPIPSMetric:
+    """Optional LPIPS metric wrapper. Returns NaN if lpips package is unavailable."""
+
+    def __init__(self, device: torch.device, net: str = "alex") -> None:
+        self.available = False
+        self.metric = None
+        try:
+            import lpips  # type: ignore
+
+            self.metric = lpips.LPIPS(net=net).to(device).eval()
+            self.available = True
+        except Exception:
+            self.available = False
+            self.metric = None
+
+    @torch.no_grad()
+    def __call__(self, x_01: torch.Tensor, y_01: torch.Tensor) -> float:
+        if not self.available or self.metric is None:
+            return float("nan")
+        # LPIPS expects normalized range [-1, 1].
+        x = x_01.mul(2.0).sub(1.0)
+        y = y_01.mul(2.0).sub(1.0)
+        val = self.metric(x, y).mean().item()
+        return float(val)
 
 
-def compute_lpips(model, x: torch.Tensor, y: torch.Tensor) -> float:
-    """x, y: (B,3,H,W). 返回平均 LPIPS 距离。"""
-    with torch.no_grad():
-        d = model(x, y)
-    return d.mean().item()
+@dataclass
+class MetricAverager:
+    sums: Dict[str, float] = field(default_factory=dict)
+    counts: Dict[str, int] = field(default_factory=dict)
 
+    def update(self, values: Dict[str, float], n: int = 1) -> None:
+        for k, v in values.items():
+            if isinstance(v, float) and math.isnan(v):
+                continue
+            self.sums[k] = self.sums.get(k, 0.0) + float(v) * n
+            self.counts[k] = self.counts.get(k, 0) + n
 
-def compute_fid(real_features: np.ndarray, fake_features: np.ndarray) -> float:
-    """FID = ||mu_r - mu_f||^2 + Tr(Sigma_r + Sigma_f - 2*sqrt(Sigma_r*Sigma_f))."""
-    mu_r, mu_f = real_features.mean(axis=0), fake_features.mean(axis=0)
-    sigma_r = np.cov(real_features, rowvar=False)
-    sigma_f = np.cov(fake_features, rowvar=False)
-    eps = 1e-6
-    diff = mu_r - mu_f
-    covmean, _ = np.linalg.sqrtm(sigma_r.dot(sigma_f), disp=False)
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    fid = diff.dot(diff) + np.trace(sigma_r) + np.trace(sigma_f) - 2 * np.trace(covmean)
-    return float(fid)
-
-
-def compute_clip_score(image_features: torch.Tensor, text_features: torch.Tensor) -> torch.Tensor:
-    """image_features (B, D), text_features (B, D) normalized. Return (B,) cosine sim."""
-    return (image_features * text_features).sum(dim=-1)
+    def compute(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for k, s in self.sums.items():
+            c = max(1, self.counts.get(k, 0))
+            out[k] = s / c
+        return out
