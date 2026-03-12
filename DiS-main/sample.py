@@ -103,8 +103,10 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default="/TrainData/Multimodal/zhengcong.fei/dis/results/DiS-H-2-imagenet-class-cond-256/checkpoints/ckpt.pt",) 
     
     parser.add_argument('--latent_space', type=bool, default=True,) 
-    parser.add_argument('--vae_path', type=str, default='/TrainData/Multimodal/zhengcong.fei/dis/vae') 
-    parser.add_argument('--hf-endpoint', type=str, default='https://hf-mirror.com')
+    parser.add_argument('--vae_path', type=str, default='stabilityai/sd-vae-ft-mse',
+                        help='VAE 路径：HF 模型 ID 或本地含 config.json 的文件夹')
+    parser.add_argument('--hf-endpoint', type=str, default=os.environ.get('HF_ENDPOINT', 'https://huggingface.co'),
+                        help='HuggingFace 下载镜像，hf-mirror 不可用时用 https://huggingface.co')
     parser.add_argument('--hf-endpoint-force', action='store_true')
     args = parser.parse_args()
 

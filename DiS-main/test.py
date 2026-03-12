@@ -73,8 +73,10 @@ def test_fid_score():
 
 
 def test_vae(): 
+    # 使用 HF 模型 ID 或本地含 config.json 的文件夹路径
+    os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
     from diffusers.models import AutoencoderKL 
-    vae_path = '/TrainData/Multimodal/zhengcong.fei/dis/vae'
+    vae_path = os.environ.get("VAE_PATH", "stabilityai/sd-vae-ft-mse")
     vae = AutoencoderKL.from_pretrained(vae_path)
 
 # test_dismodel() 

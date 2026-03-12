@@ -6,8 +6,8 @@ from collections import OrderedDict
 from copy import deepcopy
 from glob import glob
 
-# 必须在导入 diffusers/huggingface_hub 之前设置，否则 hub 会缓存默认 huggingface.co
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+# 必须在导入 diffusers/huggingface_hub 之前设置；默认用官方源，hf-mirror 不可用时无需改
+os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
 os.environ.setdefault("HUGGINGFACE_HUB_ENDPOINT", os.environ["HF_ENDPOINT"])
 
 import numpy as np
@@ -203,6 +203,11 @@ def main(args):
     # Setup DDP
     dist.init_process_group("nccl")
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+    per_gpu_batch = args.global_batch_size // dist.get_world_size()
+    assert per_gpu_batch >= 2, (
+        f"per-GPU batch size must be >= 2 for meaningful steganography (got {per_gpu_batch}). "
+        "When batch=1, secret=cover[randperm(1)] yields secret==cover always."
+    )
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
     seed = args.global_seed * dist.get_world_size() + rank
@@ -391,7 +396,12 @@ def main(args):
                     adjust_learning_rate(opt, data_iter_step / len(loader) + epoch, args)
                 
                 cover = samples[0].to(device)
-                secret = cover[torch.randperm(cover.shape[0], device=device)]
+                perm = torch.randperm(cover.shape[0], device=device)
+                secret = cover[perm]
+                # 保证 cover 与 secret 不同：randperm 有概率为恒等排列（尤其 batch=2 时约 50%）导致所有 pair 相同
+                same = (perm == torch.arange(perm.shape[0], device=device)).all()
+                if same:
+                    secret = cover.roll(1, dims=0)
                 
                 if args.num_classes > 0: 
                     labels = samples[1].to(device) 
@@ -470,24 +480,7 @@ def main(args):
                         step=global_step,
                     )
 
-                # Save checkpoint:
-                if should_step and global_step % args.ckpt_every == 0 and global_step > 0:
-                    if rank == 0:
-                        checkpoint = {
-                            "model": model.module.state_dict(),
-                            "ema": ema.state_dict(),
-                            "decoder": unwrap_module(decoder).state_dict(),
-                            "secret_vae": secret_vae.state_dict(),
-                            "interference": unwrap_module(interference).state_dict(),
-                            "opt": opt.state_dict(),
-                            "args": args,
-                            "global_step": global_step,
-                        }
-                        checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
-                        torch.save(checkpoint, checkpoint_path) 
-                    dist.barrier()
-                
-                # eval
+                # Sample images: 每 eval_steps (默认5000) 步保存一次
                 if should_step and global_step % args.eval_steps == 0 and global_step > 0:
                     dist.barrier()
                     if rank == 0:
@@ -506,12 +499,14 @@ def main(args):
                                 device=device,
                             )
                             eval_secret_seq = secret_latent_to_seq(eval_z_secret).to(dtype=eval_z_cover.dtype)
-                            eval_t = torch.full((eval_n,), 0.5, device=device, dtype=eval_z_cover.dtype)
-                            eval_t_view = eval_t.view(-1, 1, 1, 1)
-                            eval_z_noise = torch.randn_like(eval_z_cover)
-                            eval_z_noisy = (1 - eval_t_view) * eval_z_cover + eval_t_view * eval_z_noise
-                            eval_v_pred = ema(eval_z_noisy, t=eval_t, labels=eval_labels, secret_seq=eval_secret_seq)
-                            eval_z_stego = eval_z_noisy - eval_t_view * eval_v_pred
+                            # 多步 ODE 采样：从 t=1(纯噪声) 积分到 t=0，提升生成质量
+                            eval_z_stego = torch.randn_like(eval_z_cover)
+                            dt = 1.0 / args.eval_num_steps
+                            for k in range(args.eval_num_steps):
+                                t_val = 1.0 - k / args.eval_num_steps
+                                eval_t = torch.full((eval_n,), t_val, device=device, dtype=eval_z_cover.dtype)
+                                eval_v_pred = ema(eval_z_stego, t=eval_t, labels=eval_labels, secret_seq=eval_secret_seq)
+                                eval_z_stego = eval_z_stego - dt * eval_v_pred
 
                             if args.latent_space == True:
                                 stego_preview = vae.decode(eval_z_stego / 0.18215).sample
@@ -529,6 +524,27 @@ def main(args):
                         
                     dist.barrier()
 
+        # Checkpoint: 仅保存两个——warmup 结束后、整个训练结束后
+        ckpt_epochs_0indexed = sorted(set([
+            args.warmup_epochs - 1,   # warmup 结束
+            args.epochs - 1,          # 训练全部结束
+        ]))
+        if epoch in ckpt_epochs_0indexed and rank == 0:
+            checkpoint = {
+                "model": model.module.state_dict(),
+                "ema": ema.state_dict(),
+                "decoder": unwrap_module(decoder).state_dict(),
+                "secret_vae": secret_vae.state_dict(),
+                "interference": unwrap_module(interference).state_dict(),
+                "opt": opt.state_dict(),
+                "args": args,
+                "global_step": global_step,
+                "epoch": epoch,
+            }
+            checkpoint_path = f"{checkpoint_dir}/epoch_{epoch+1:02d}.pt"
+            torch.save(checkpoint, checkpoint_path)
+        if epoch in ckpt_epochs_0indexed:
+            dist.barrier()
 
 
 if __name__ == "__main__": 
@@ -545,21 +561,24 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None)
     
     parser.add_argument("--model", type=str, choices=list(DiS_models.keys()), default="DiS-L/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512, 64, 32], default=32)
-    parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--image-size", type=int, choices=[1024, 512, 256, 64, 32], default=1024)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--global-batch-size", type=int, default=128)
     parser.add_argument("--global-seed", type=int, default=420) 
 
-    parser.add_argument('--lr', type=float, default=1e-4,) 
+    parser.add_argument('--lr', type=float, default=5e-5, help='学习率，稍低有利于 l_gen 收敛') 
     parser.add_argument('--min_lr', type=float, default=1e-6,)
-    parser.add_argument('--warmup_epochs', type=int, default=5,)
+    parser.add_argument('--warmup_epochs', type=int, default=3)
     parser.add_argument('--accum_iter', default=1, type=int,) 
-    parser.add_argument('--eval_steps', default=1000, type=int,) 
+    parser.add_argument('--eval_steps', default=5000, type=int, help='每多少步保存一次 sample 图片')
+    parser.add_argument('--eval_num_steps', default=10, type=int, help='sample 生成时的 ODE 积分步数，多步可提升清晰度')
 
-    parser.add_argument('--latent_space', type=bool, default=False) 
-    parser.add_argument('--vae_path', type=str, default='/TrainData/Multimodal/zhengcong.fei/dis/vae') 
+    parser.add_argument('--latent_space', type=bool, default=True) 
+    parser.add_argument('--vae_path', type=str, default='stabilityai/sd-vae-ft-mse',
+                        help='VAE 路径：HuggingFace 模型 ID (如 stabilityai/sd-vae-ft-mse) 或本地含 config.json 的文件夹。'
+                             '若网络不通，可先运行: huggingface-cli download stabilityai/sd-vae-ft-mse --local-dir ./vae ，再用 --vae_path ./vae')
     parser.add_argument('--secret-vae-model', type=str, default='stabilityai/sd-vae-ft-mse')
     parser.add_argument('--secret_dim', type=int, default=None)
     parser.add_argument('--target-lambda', type=float, default=1.0)
@@ -567,7 +586,9 @@ if __name__ == "__main__":
     parser.add_argument('--rampup-steps', type=int, default=3000)
     parser.add_argument('--eval-batch-size', type=int, default=8)
     parser.add_argument('--freeze-secret-decoder', action='store_true')
-    parser.add_argument('--hf-endpoint', type=str, default='https://hf-mirror.com')
-    parser.add_argument('--hf-endpoint-force', action='store_true',default=True)
+    parser.add_argument('--hf-endpoint', type=str,
+                        default=os.environ.get('HF_ENDPOINT', 'https://huggingface.co'),
+                        help='HuggingFace 下载镜像。hf-mirror 不可用时请用 https://huggingface.co ，国内无代理时可试 https://hf-mirror.com')
+    parser.add_argument('--hf-endpoint-force', action='store_true', default=True)
     args = parser.parse_args()
     main(args)

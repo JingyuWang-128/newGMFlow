@@ -5,8 +5,8 @@ import os
 import torch
 import torch.nn as nn
 
-# Default to HF mirror in restricted network environments.
-_DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
+# 默认用官方源；hf-mirror 不可用时可直接用。国内无代理可 export HF_ENDPOINT=https://hf-mirror.com
+_DEFAULT_HF_ENDPOINT = "https://huggingface.co"
 os.environ.setdefault("HF_ENDPOINT", _DEFAULT_HF_ENDPOINT)
 # Some huggingface_hub versions honor this env name instead.
 os.environ.setdefault("HUGGINGFACE_HUB_ENDPOINT", os.environ["HF_ENDPOINT"])
