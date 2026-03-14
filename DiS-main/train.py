@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import random
 from pathlib import Path
 from collections import OrderedDict
 from copy import deepcopy
@@ -28,7 +29,7 @@ from continuous_vae import ContinuousVAE
 from decoder import ResMambaSecretDecoder
 from interference import LatentInterference
 from models_dis import DiS_models, StegoDiSModel
-from tools.dataset import CelebADataset
+from tools.dataset import CelebADataset, StratifiedDistributedBatchSampler
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -202,14 +203,29 @@ def main(args):
     endpoint = configure_hf_endpoint(args.hf_endpoint, force=args.hf_endpoint_force)
     # Setup DDP
     dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    device = rank % torch.cuda.device_count()
+
+    # -1 表示每轮训练随机 seed，利于不同 run 间数据顺序变化，更符合真实隐写场景
+    if args.global_seed < 0:
+        if rank == 0:
+            args.global_seed = random.randint(0, 2**31 - 1)
+        t = torch.tensor([args.global_seed], dtype=torch.long, device=device)
+        dist.broadcast(t, 0)
+        args.global_seed = t.item()
+    if getattr(args, "split_seed", 42) < 0:
+        if rank == 0:
+            args.split_seed = random.randint(0, 2**31 - 1)
+        t = torch.tensor([args.split_seed], dtype=torch.long, device=device)
+        dist.broadcast(t, 0)
+        args.split_seed = t.item()
+
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     per_gpu_batch = args.global_batch_size // dist.get_world_size()
     assert per_gpu_batch >= 2, (
         f"per-GPU batch size must be >= 2 for meaningful steganography (got {per_gpu_batch}). "
         "When batch=1, secret=cover[randperm(1)] yields secret==cover always."
     )
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
@@ -258,6 +274,9 @@ def main(args):
     ).to(device)
     interference = LatentInterference(
         latent_hw=(model_img_size, model_img_size),
+        identity_prob=args.interference_identity_prob,
+        noise_std=args.interference_noise_std,
+        jpeg_quality=tuple(args.interference_jpeg_quality),
     ).to(device)
 
     secret_vae.eval()
@@ -306,7 +325,11 @@ def main(args):
     opt = torch.optim.AdamW(optim_params, lr=args.lr, weight_decay=0)
     if checkpoint is not None and "opt" in checkpoint:
         opt.load_state_dict(checkpoint["opt"])
-    print('lr: ', args.lr)
+    use_amp = getattr(args, "amp", True)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if checkpoint is not None and "scaler" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler"])
+    print('lr: ', args.lr, ', AMP: ', use_amp)
 
     # Setup data
     if args.resize_only == False: 
@@ -354,24 +377,42 @@ def main(args):
                 f"test_ratio={args.test_ratio}, seed={args.split_seed}"
             )
 
-
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
-        shuffle=False,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
+    # 数据加载：celeba 使用分层采样，保证每个 batch 中样本来自多个数据集
+    per_gpu_batch = int(args.global_batch_size // dist.get_world_size())
+    if args.dataset_type == "celeba":
+        batch_sampler = StratifiedDistributedBatchSampler(
+            dataset,
+            batch_size=per_gpu_batch,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed,
+            drop_last=True,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        sampler = batch_sampler  # 供 set_epoch 使用
+    else:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=per_gpu_batch,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
 
     update_ema(ema, model.module, decay=0) 
     model.train() 
@@ -433,35 +474,40 @@ def main(args):
                     rampup_steps=args.rampup_steps,
                 )
 
-                # 1. 生成器推理 (必须传入 t 和 secret_seq)
-                v_pred = model(z_noisy, t=t, labels=labels, secret_seq=secret_seq)
-                l_gen = F.mse_loss(v_pred, v_target)
+                # 1-4. Forward (AMP 混合精度)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    # 1. 生成器推理 (必须传入 t 和 secret_seq)
+                    v_pred = model(z_noisy, t=t, labels=labels, secret_seq=secret_seq)
+                    l_gen = F.mse_loss(v_pred, v_target)
 
-                # 2. 隐写去噪推导
-                z_stego_hat = z_noisy - t_view * v_pred
+                    # 2. 隐写去噪推导
+                    z_stego_hat = z_noisy - t_view * v_pred
 
-                # 3. 攻击与解码
-                z_attacked = interference(z_stego_hat)
-                decoder_input = prepare_decoder_input(secret_vae, z_attacked, latent_space=args.latent_space)
-                z_secret_pred = decode_secret(decoder, decoder_input)
-                z_secret_pred = align_secret_prediction(z_secret_pred, z_secret)
-                l_secret = F.mse_loss(z_secret_pred, z_secret)
+                    # 3. 攻击与解码
+                    z_attacked = interference(z_stego_hat)
+                    decoder_input = prepare_decoder_input(secret_vae, z_attacked, latent_space=args.latent_space)
+                    z_secret_pred = decode_secret(decoder, decoder_input)
+                    z_secret_pred = align_secret_prediction(z_secret_pred, z_secret)
+                    l_secret = F.mse_loss(z_secret_pred, z_secret)
 
-                # 4. 总损失
-                loss = l_gen + current_lambda * l_secret
+                    # 4. 总损失
+                    loss = l_gen + current_lambda * l_secret
                 loss_value = loss.item()
 
-                if not math.isfinite(loss_value): 
+                if not math.isfinite(loss_value):
                     opt.zero_grad(set_to_none=True)
                     continue
-                
-                (loss / args.accum_iter).backward()
+
+                scaler.scale(loss / args.accum_iter).backward()
                 should_step = (data_iter_step + 1) % args.accum_iter == 0
 
                 if should_step:
+                    scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(optim_params, 1.0)
-                    opt.step()
+                    scaler.step(opt)
+                    scaler.update()
                     opt.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
                     update_ema(ema, model.module)
                     global_step += 1
 
@@ -480,7 +526,7 @@ def main(args):
                         step=global_step,
                     )
 
-                # Sample images: 每 eval_steps (默认5000) 步保存一次
+                # Eval: 按 eval_steps 频率进行验证（ODE 采样 + 保存 sample_{step}.png）
                 if should_step and global_step % args.eval_steps == 0 and global_step > 0:
                     dist.barrier()
                     if rank == 0:
@@ -489,17 +535,12 @@ def main(args):
                             eval_cover = cover[:eval_n]
                             eval_secret = secret[:eval_n]
                             eval_labels = labels[:eval_n] if labels is not None else None
-
-                            if args.latent_space == True:
+                            if args.latent_space:
                                 eval_z_cover = vae.encode(eval_cover).latent_dist.sample().mul_(0.18215)
                             else:
                                 eval_z_cover = eval_cover
-
-                            eval_z_secret = encode_secret(secret_vae, eval_secret).to(
-                                device=device,
-                            )
+                            eval_z_secret = encode_secret(secret_vae, eval_secret).to(device=device)
                             eval_secret_seq = secret_latent_to_seq(eval_z_secret).to(dtype=eval_z_cover.dtype)
-                            # 多步 ODE 采样：从 t=1(纯噪声) 积分到 t=0，提升生成质量
                             eval_z_stego = torch.randn_like(eval_z_cover)
                             dt = 1.0 / args.eval_num_steps
                             for k in range(args.eval_num_steps):
@@ -507,12 +548,10 @@ def main(args):
                                 eval_t = torch.full((eval_n,), t_val, device=device, dtype=eval_z_cover.dtype)
                                 eval_v_pred = ema(eval_z_stego, t=eval_t, labels=eval_labels, secret_seq=eval_secret_seq)
                                 eval_z_stego = eval_z_stego - dt * eval_v_pred
-
-                            if args.latent_space == True:
+                            if args.latent_space:
                                 stego_preview = vae.decode(eval_z_stego / 0.18215).sample
                             else:
                                 stego_preview = eval_z_stego
-
                             preview = torch.cat([eval_cover, eval_secret, stego_preview], dim=0)
                             save_image(
                                 preview,
@@ -521,14 +560,39 @@ def main(args):
                                 normalize=True,
                                 value_range=(-1, 1),
                             )
-                        
                     dist.barrier()
 
-        # Checkpoint: 仅保存两个——warmup 结束后、整个训练结束后
-        ckpt_epochs_0indexed = sorted(set([
-            args.warmup_epochs - 1,   # warmup 结束
-            args.epochs - 1,          # 训练全部结束
-        ]))
+        # Sample: 每 epoch 另存一张（sample_epoch_XX.png），便于按 epoch 归档
+        if rank == 0:
+            with torch.no_grad():
+                eval_n = min(args.eval_batch_size, cover.shape[0])
+                eval_cover = cover[:eval_n]
+                eval_secret = secret[:eval_n]
+                eval_labels = labels[:eval_n] if labels is not None else None
+                if args.latent_space:
+                    eval_z_cover = vae.encode(eval_cover).latent_dist.sample().mul_(0.18215)
+                else:
+                    eval_z_cover = eval_cover
+                eval_z_secret = encode_secret(secret_vae, eval_secret).to(device=device)
+                eval_secret_seq = secret_latent_to_seq(eval_z_secret).to(dtype=eval_z_cover.dtype)
+                eval_z_stego = torch.randn_like(eval_z_cover)
+                dt = 1.0 / args.eval_num_steps
+                for k in range(args.eval_num_steps):
+                    t_val = 1.0 - k / args.eval_num_steps
+                    eval_t = torch.full((eval_n,), t_val, device=device, dtype=eval_z_cover.dtype)
+                    eval_v_pred = ema(eval_z_stego, t=eval_t, labels=eval_labels, secret_seq=eval_secret_seq)
+                    eval_z_stego = eval_z_stego - dt * eval_v_pred
+                if args.latent_space:
+                    stego_preview = vae.decode(eval_z_stego / 0.18215).sample
+                else:
+                    stego_preview = eval_z_stego
+                preview = torch.cat([eval_cover, eval_secret, stego_preview], dim=0)
+                save_image(preview, os.path.join(experiment_dir, f"sample_epoch_{epoch+1:02d}.png"),
+                          nrow=eval_n, normalize=True, value_range=(-1, 1))
+        dist.barrier()
+
+        # Checkpoint: 从 epochs/2 之后开始，每 epoch 保存一次（如 12 epoch 则从第 7 个 epoch 起保存）
+        ckpt_epochs_0indexed = list(range(args.epochs // 2, args.epochs))
         if epoch in ckpt_epochs_0indexed and rank == 0:
             checkpoint = {
                 "model": model.module.state_dict(),
@@ -537,6 +601,7 @@ def main(args):
                 "secret_vae": secret_vae.state_dict(),
                 "interference": unwrap_module(interference).state_dict(),
                 "opt": opt.state_dict(),
+                "scaler": scaler.state_dict(),
                 "args": args,
                 "global_step": global_step,
                 "epoch": epoch,
@@ -552,7 +617,8 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, default=str(Path(__file__).resolve().parent / "data" / "placeholder"))
     parser.add_argument("--data-split", type=str, choices=["train", "test", "all"], default="train")
     parser.add_argument("--test-ratio", type=float, default=0.1)
-    parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument("--split-seed", type=int, default=-1,
+                        help='数据划分/打乱 seed。-1 表示每轮随机，不同 run 数据顺序不同，更符合真实隐写')
     parser.add_argument("--results-dir", type=str, default="/home/wangjingyu/newGMFlow/DiS-main/outputs/run_train_local")
     parser.add_argument("--task-type", type=str, choices=['uncond', 'class-cond', 'text-cond'], default='uncond')
     parser.add_argument("--dataset-type", type=str, choices=['cifar-10', 'imagenet', 'celeba'], default='celeba')
@@ -561,17 +627,21 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None)
     
     parser.add_argument("--model", type=str, choices=list(DiS_models.keys()), default="DiS-L/2")
-    parser.add_argument("--image-size", type=int, choices=[1024, 512, 256, 64, 32], default=1024)
+    parser.add_argument("--image-size", type=int, choices=[1024, 512, 256, 64, 32], default=512,
+                        help='图像尺寸。512 显存友好，3 卡约 global-batch-size 6；1024 需更多显存')
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--ckpt-every", type=int, default=5000)
-    parser.add_argument("--global-batch-size", type=int, default=128)
-    parser.add_argument("--global-seed", type=int, default=420) 
+    parser.add_argument("--global-batch-size", type=int, default=6,
+                        help='总 batch 数，需被 GPU 数整除。512 图 + 3 卡约 6；显存不足时可减小并增大 accum_iter')
+    parser.add_argument("--global-seed", type=int, default=-1,
+                        help='训练随机 seed。-1 表示每轮随机，配合 split-seed=-1 实现每次训练不同数据顺序') 
 
-    parser.add_argument('--lr', type=float, default=5e-5, help='学习率，稍低有利于 l_gen 收敛') 
-    parser.add_argument('--min_lr', type=float, default=1e-6,)
-    parser.add_argument('--warmup_epochs', type=int, default=3)
-    parser.add_argument('--accum_iter', default=1, type=int,) 
+    parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
+    parser.add_argument('--min_lr', type=float, default=1e-6)
+    parser.add_argument('--warmup_epochs', type=int, default=1)
+    parser.add_argument('--accum_iter', default=2, type=int)
+    parser.add_argument('--no-amp', action='store_true', help='禁用 AMP，使用 float32')
     parser.add_argument('--eval_steps', default=5000, type=int, help='每多少步保存一次 sample 图片')
     parser.add_argument('--eval_num_steps', default=10, type=int, help='sample 生成时的 ODE 积分步数，多步可提升清晰度')
 
@@ -582,13 +652,24 @@ if __name__ == "__main__":
     parser.add_argument('--secret-vae-model', type=str, default='stabilityai/sd-vae-ft-mse')
     parser.add_argument('--secret_dim', type=int, default=None)
     parser.add_argument('--target-lambda', type=float, default=1.0)
-    parser.add_argument('--warmup-steps', type=int, default=2000)
-    parser.add_argument('--rampup-steps', type=int, default=3000)
-    parser.add_argument('--eval-batch-size', type=int, default=8)
+    parser.add_argument('--warmup-steps', type=int, default=1000)
+    parser.add_argument('--rampup-steps', type=int, default=2000)
+    parser.add_argument('--eval-batch-size', type=int, default=4)
     parser.add_argument('--freeze-secret-decoder', action='store_true')
     parser.add_argument('--hf-endpoint', type=str,
                         default=os.environ.get('HF_ENDPOINT', 'https://huggingface.co'),
                         help='HuggingFace 下载镜像。hf-mirror 不可用时请用 https://huggingface.co ，国内无代理时可试 https://hf-mirror.com')
     parser.add_argument('--hf-endpoint-force', action='store_true', default=True)
+
+    # LatentInterference 干扰参数：用于提升秘密鲁棒性与保真度
+    parser.add_argument('--interference-identity-prob', type=float, default=0.5,
+                        help='identity 攻击概率，越低则更多使用真实攻击，利于鲁棒性 (默认 0.1)')
+    parser.add_argument('--interference-noise-std', type=float, default=0.05,
+                        help='高斯噪声标准差，稍大利于鲁棒性 (默认 0.05)')
+    parser.add_argument('--interference-jpeg-quality', type=float, nargs=2, default=[40.0, 90.0],
+                        metavar=('MIN', 'MAX'),
+                        help='JPEG 质量范围 [min, max]，默认 40 90')
+
     args = parser.parse_args()
+    args.amp = not args.no_amp
     main(args)
