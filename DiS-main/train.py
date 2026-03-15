@@ -476,21 +476,37 @@ def main(args):
 
                 # 1-4. Forward (AMP 混合精度)
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    # 1. 生成器推理 (必须传入 t 和 secret_seq)
+                    # 1. 生成器推理
                     v_pred = model(z_noisy, t=t, labels=labels, secret_seq=secret_seq)
                     l_gen = F.mse_loss(v_pred, v_target)
 
                     # 2. 隐写去噪推导
                     z_stego_hat = z_noisy - t_view * v_pred
 
+                    # ================= 核心修改区：保护机制 =================
+                    # 设定时间步阈值（例如 0.5）。
+                    # 当 t > 0.5 时，重构图像太差，截断流向生成器的梯度，只允许解码器自我更新。
+                    # 当 t <= 0.5 时，允许隐写梯度联合优化生成器。
+                    t_threshold = 0.5
+                    is_low_noise = (t_view <= t_threshold).float()
+                    
+                    # 梯度阻断技巧：高噪阶段切断生成器梯度，低噪阶段保留
+                    z_stego_safe = z_stego_hat * is_low_noise + z_stego_hat.detach() * (1.0 - is_low_noise)
+
                     # 3. 攻击与解码
-                    z_attacked = interference(z_stego_hat)
+                    z_attacked = interference(z_stego_safe)
                     decoder_input = prepare_decoder_input(secret_vae, z_attacked, latent_space=args.latent_space)
                     z_secret_pred = decode_secret(decoder, decoder_input)
                     z_secret_pred = align_secret_prediction(z_secret_pred, z_secret)
-                    l_secret = F.mse_loss(z_secret_pred, z_secret)
+                    
+                    # 4. 计算隐写损失，并引入动态时间步权重
+                    # 使用 (1 - t)^2 作为权重，使得 t=0 (纯净图像) 时权重最大，t=1 (纯噪声) 时权重为 0
+                    t_weight = (1.0 - t).view(-1, 1, 1, 1) ** 2
+                    l_secret_unweighted = F.mse_loss(z_secret_pred, z_secret, reduction='none')
+                    l_secret = (l_secret_unweighted * t_weight).mean()
+                    # ========================================================
 
-                    # 4. 总损失
+                    # 5. 总损失
                     loss = l_gen + current_lambda * l_secret
                 loss_value = loss.item()
 
@@ -632,7 +648,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--ckpt-every", type=int, default=5000)
-    parser.add_argument("--global-batch-size", type=int, default=6,
+    parser.add_argument("--global-batch-size", type=int, default=8,
                         help='总 batch 数，需被 GPU 数整除。512 图 + 3 卡约 6；显存不足时可减小并增大 accum_iter')
     parser.add_argument("--global-seed", type=int, default=-1,
                         help='训练随机 seed。-1 表示每轮随机，配合 split-seed=-1 实现每次训练不同数据顺序') 
